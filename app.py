@@ -16,39 +16,103 @@ app = FastAPI()
 GRAPH_VER = "v22.0"
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
-# pendência por número: { from_number: {"tx": {...}, "stage": "collect"|"confirm", "await": "campo"} }
+# Estado por número: {"tx": {...}, "await": "tipo|valor|categoria|descricao|pagamento|data|confirm", "stage":"wizard"}
 PENDING = {}
 
-# Opções fixas para ORIGEM de receita (vai para coluna "categoria")
+# ORIGEM (receita) -> gravar na coluna categoria
 ORIGENS_RECEITA = [
     "Salário", "Férias", "13º", "Bônus", "Comissão", "PLR",
     "Reembolso", "Rendimentos", "Freela", "Outros"
 ]
 
-# Campos obrigatórios (categoria sempre obrigatória, mas a pergunta muda conforme tipo)
-REQUIRED_FIELDS = ["tipo", "valor", "categoria", "descricao", "pagamento", "data_competencia"]
+# Categorias padrão para despesa (lista)
+CATEGORIAS_DESPESA = [
+    "Mercado", "Transporte", "Moradia", "Alimentação", "Assinaturas",
+    "Saúde", "Lazer", "Educação", "Impostos", "Outros"
+]
+
+PAGAMENTOS = ["pix", "débito", "crédito", "dinheiro", "desconhecido"]
 
 # ----------------------------
-# WhatsApp send
+# WhatsApp: envio
 # ----------------------------
-def send_whatsapp_text(to: str, text: str):
-    token = os.environ["WA_ACCESS_TOKEN"]
+def wa_url():
     phone_number_id = os.environ["WA_PHONE_NUMBER_ID"]
-    url = f"https://graph.facebook.com/{GRAPH_VER}/{phone_number_id}/messages"
+    return f"https://graph.facebook.com/{GRAPH_VER}/{phone_number_id}/messages"
 
+def wa_headers():
+    token = os.environ["WA_ACCESS_TOKEN"]
+    return {"Authorization": f"Bearer {token}"}
+
+def send_whatsapp_text(to: str, text: str):
     payload = {
         "messaging_product": "whatsapp",
         "to": to,
         "type": "text",
         "text": {"body": text[:3800]},
     }
+    r = requests.post(wa_url(), headers=wa_headers(), json=payload, timeout=20)
+    r.raise_for_status()
+    return r.json()
 
-    r = requests.post(url, headers={"Authorization": f"Bearer {token}"}, json=payload, timeout=20)
+def send_whatsapp_buttons(to: str, body_text: str, buttons: list):
+    """
+    buttons: [{"id":"x","title":"X"}, ...]  (máx 3)
+    """
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "interactive",
+        "interactive": {
+            "type": "button",
+            "body": {"text": body_text[:1024]},
+            "action": {
+                "buttons": [
+                    {"type": "reply", "reply": {"id": b["id"], "title": b["title"][:20]}}
+                    for b in buttons[:3]
+                ]
+            },
+        },
+    }
+    r = requests.post(wa_url(), headers=wa_headers(), json=payload, timeout=20)
+    r.raise_for_status()
+    return r.json()
+
+def send_whatsapp_list(to: str, body_text: str, button_label: str, rows: list, section_title: str = "Opções"):
+    """
+    rows: [{"id":"x","title":"X","description":"..."}]
+    """
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "interactive",
+        "interactive": {
+            "type": "list",
+            "body": {"text": body_text[:1024]},
+            "action": {
+                "button": button_label[:20],
+                "sections": [
+                    {
+                        "title": section_title[:24],
+                        "rows": [
+                            {
+                                "id": r["id"][:200],
+                                "title": r["title"][:24],
+                                "description": (r.get("description") or "")[:72],
+                            }
+                            for r in rows[:10]
+                        ],
+                    }
+                ],
+            },
+        },
+    }
+    r = requests.post(wa_url(), headers=wa_headers(), json=payload, timeout=20)
     r.raise_for_status()
     return r.json()
 
 # ----------------------------
-# Sheets append
+# Sheets: append
 # ----------------------------
 def _sheets_service():
     creds_path = os.environ["GOOGLE_APPLICATION_CREDENTIALS"]
@@ -74,63 +138,30 @@ def append_row(values: list):
     )
 
 # ----------------------------
-# Helpers: parsing/validation
+# Parsing / Normalização
 # ----------------------------
-def _now_iso():
+def now_iso():
     return dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+def today_iso():
+    return dt.date.today().isoformat()
 
 def parse_valor(text: str):
     t = text.lower()
-    m = re.search(r"(\d{1,6}(?:[.,]\d{2})?)", t)
+    m = re.search(r"(\d{1,9}(?:[.,]\d{2})?)", t)
     if not m:
         return None
-    raw = m.group(1)
-    raw = raw.replace(".", "").replace(",", ".")
+    raw = m.group(1).replace(".", "").replace(",", ".")
     try:
         return float(raw)
     except:
         return None
 
-def parse_tipo(text: str):
-    t = text.lower()
-    if any(k in t for k in ["receita", "recebi", "entrada", "salário", "salario", "ganhei", "caiu", "pix recebido"]):
-        return "receita"
-    if any(k in t for k in ["gasto", "paguei", "comprei", "debitei", "gastei", "pago", "despesa"]):
-        return "gasto"
-    return None
-
-def parse_pagamento(text: str):
-    t = text.lower()
-    if "pix" in t:
-        return "pix"
-    if any(k in t for k in ["debito", "débito"]):
-        return "débito"
-    if any(k in t for k in ["credito", "crédito", "cartao", "cartão"]):
-        return "crédito"
-    if any(k in t for k in ["dinheiro", "cash"]):
-        return "dinheiro"
-    return None
-
-def parse_categoria_despesa(text: str):
-    t = text.lower()
-    if any(k in t for k in ["mercado", "supermerc", "padaria", "hortifruti"]):
-        return "Mercado"
-    if any(k in t for k in ["uber", "99", "ônibus", "onibus", "metro", "gasolina", "combust"]):
-        return "Transporte"
-    if any(k in t for k in ["aluguel", "condominio", "condomínio", "luz", "energia", "agua", "água", "internet"]):
-        return "Moradia"
-    if any(k in t for k in ["ifood", "restaurante", "lanche", "pizza", "bar"]):
-        return "Alimentação"
-    if any(k in t for k in ["netflix", "spotify", "assinatura", "prime"]):
-        return "Assinaturas"
-    return None
-
-def parse_data_competencia(text: str):
-    t = text.lower()
-
-    if "hoje" in t:
+def parse_data(text: str):
+    t = text.lower().strip()
+    if t == "hoje":
         return dt.date.today().isoformat()
-    if "ontem" in t:
+    if t == "ontem":
         return (dt.date.today() - dt.timedelta(days=1)).isoformat()
 
     m = re.search(r"\b(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?\b", t)
@@ -150,111 +181,24 @@ def parse_data_competencia(text: str):
     except:
         return None
 
-def normalize_tipo(answer: str):
-    a = answer.lower().strip()
-    if a in ["gasto", "despesa", "saída", "saida"]:
-        return "gasto"
-    if a in ["receita", "entrada"]:
-        return "receita"
-    return None
-
-def normalize_pagamento(answer: str):
-    a = answer.lower().strip()
-    if a in ["pix"]:
-        return "pix"
-    if a in ["debito", "débito"]:
-        return "débito"
-    if a in ["credito", "crédito", "cartao", "cartão"]:
-        return "crédito"
-    if a in ["dinheiro", "cash"]:
-        return "dinheiro"
-    return None
-
-def normalize_data(answer: str):
-    a = answer.lower().strip()
-    if a == "hoje":
-        return dt.date.today().isoformat()
-    if a == "ontem":
-        return (dt.date.today() - dt.timedelta(days=1)).isoformat()
-    return parse_data_competencia(a)
-
-def normalize_origem_receita(answer: str):
-    a = answer.strip().lower()
-
-    mapa = {
-        "salario": "Salário", "salário": "Salário",
-        "ferias": "Férias", "férias": "Férias",
-        "13": "13º", "13o": "13º", "13º": "13º", "decimo terceiro": "13º", "décimo terceiro": "13º",
-        "bonus": "Bônus", "bônus": "Bônus",
-        "comissao": "Comissão", "comissão": "Comissão",
-        "plr": "PLR",
-        "reembolso": "Reembolso",
-        "rendimentos": "Rendimentos",
-        "freela": "Freela",
-        "outro": "Outros", "outros": "Outros"
-    }
-    if a in mapa:
-        return mapa[a]
-
-    # aceita exatamente igual a lista (case-insensitive)
-    for opt in ORIGENS_RECEITA:
-        if a == opt.lower():
-            return opt
-
-    return None
-
-def missing_fields(tx: dict):
-    missing = []
-    for f in REQUIRED_FIELDS:
-        v = tx.get(f)
-        if v is None or (isinstance(v, str) and not v.strip()):
-            missing.append(f)
-    return missing
-
-def next_question(field: str, tx: dict | None = None):
-    if field == "tipo":
-        return "Qual o **TIPO**? Responda: gasto ou receita."
-    if field == "valor":
-        return "Qual o **VALOR**? Ex: 35,90"
-    if field == "categoria":
-        if tx and tx.get("tipo") == "receita":
-            return (
-                "Qual a **ORIGEM** dessa receita?\n"
-                "Responda uma destas opções:\n"
-                "- Salário / Férias / 13º / Bônus / Comissão / PLR / Reembolso / Rendimentos / Freela / Outros"
-            )
-        return "Qual a **CATEGORIA** da despesa? Ex: Mercado / Transporte / Moradia / etc."
-    if field == "descricao":
-        return "Qual a **DESCRIÇÃO** (curta)? Ex: pão e leite"
-    if field == "pagamento":
-        return "Qual o **PAGAMENTO**? Responda: pix / débito / crédito / dinheiro"
-    if field == "data_competencia":
-        return "Qual a **DATA**? Responda: hoje / ontem / ou dd/mm (ex: 29/12)"
-    return "Preciso de mais informação."
-
-def format_confirm(tx: dict):
-    v = f"{tx['valor']:.2f}".replace(".", ",") if isinstance(tx.get("valor"), (int, float)) else "N/A"
-    label_cat = "origem" if tx.get("tipo") == "receita" else "categoria"
-    return (
-        "Confirma o lançamento?\n"
-        f"- tipo: {tx.get('tipo')}\n"
-        f"- valor: {v} {tx.get('moeda','BRL')}\n"
-        f"- {label_cat}: {tx.get('categoria')}\n"
-        f"- descricao: {tx.get('descricao')}\n"
-        f"- pagamento: {tx.get('pagamento')}\n"
-        f"- data_competencia: {tx.get('data_competencia')}\n\n"
-        "Responda: SIM / CANCELAR"
-    )
+def normalize_sign(tx: dict):
+    if tx.get("valor") is None:
+        return
+    v = float(tx["valor"])
+    if tx.get("tipo") == "despesa":
+        tx["valor"] = -abs(v)
+    elif tx.get("tipo") == "receita":
+        tx["valor"] = abs(v)
 
 def tx_to_row(tx: dict):
     # id, timestamp, tipo, valor, moeda, categoria, descricao, pagamento, data_competencia, confianca, confirmado, mensagem_original
     return [
         tx["id"],
         tx["timestamp"],
-        tx["tipo"],
-        tx["valor"],
+        tx["tipo"],                 # "receita" ou "despesa"
+        tx["valor"],                # sinal já normalizado
         tx["moeda"],
-        tx["categoria"],
+        tx["categoria"],            # despesa=categoria, receita=origem
         tx["descricao"],
         tx["pagamento"],
         tx["data_competencia"],
@@ -263,51 +207,161 @@ def tx_to_row(tx: dict):
         tx["mensagem_original"],
     ]
 
-def init_tx(original_text: str):
-    tipo = parse_tipo(original_text)
-    valor = parse_valor(original_text)
-    pagamento = parse_pagamento(original_text)
-    data_comp = parse_data_competencia(original_text)
+def format_confirm(tx: dict):
+    v = f"{abs(float(tx['valor'])):.2f}".replace(".", ",") if tx.get("valor") is not None else "N/A"
+    label_cat = "origem" if tx.get("tipo") == "receita" else "categoria"
+    sinal = "+" if tx.get("tipo") == "receita" else "-"
+    return (
+        "Confirma o lançamento?\n"
+        f"- tipo: {tx.get('tipo')}\n"
+        f"- valor: {sinal}{v} {tx.get('moeda','BRL')}\n"
+        f"- {label_cat}: {tx.get('categoria')}\n"
+        f"- descricao: {tx.get('descricao')}\n"
+        f"- pagamento: {tx.get('pagamento')}\n"
+        f"- data_competencia: {tx.get('data_competencia')}\n"
+    )
 
-    categoria = None
-    if tipo == "gasto":
-        categoria = parse_categoria_despesa(original_text)
-    elif tipo == "receita":
-        # receita não tenta adivinhar origem; força pergunta se não vier
-        categoria = None
+def required_fields(tx: dict):
+    # Wizard sempre pede: tipo, valor, categoria/origem, descricao, pagamento, data
+    return ["tipo", "valor", "categoria", "descricao", "pagamento", "data_competencia"]
 
-    cleaned = original_text.strip()
-    descr = cleaned
-    if re.fullmatch(r"\s*\d{1,6}(?:[.,]\d{2})?\s*", cleaned):
-        descr = None
+def next_missing(tx: dict):
+    for f in required_fields(tx):
+        v = tx.get(f)
+        if v is None or (isinstance(v, str) and not v.strip()):
+            return f
+    return None
 
-    inferred = sum(1 for x in [tipo, valor, categoria, pagamento, data_comp, descr] if x is not None)
-    confianca = min(0.35 + inferred * 0.10, 0.95)
+# ----------------------------
+# Wizard: perguntas por seleção quando possível
+# ----------------------------
+def ask_tipo(to: str):
+    send_whatsapp_buttons(
+        to,
+        "Opa. O que vamos registrar hoje?\nEscolha uma opção:",
+        [
+            {"id": "tipo_receita", "title": "Receita"},
+            {"id": "tipo_despesa", "title": "Despesa"},
+        ],
+    )
 
-    return {
-        "id": str(uuid.uuid4()),
-        "timestamp": _now_iso(),
-        "tipo": tipo,
-        "valor": valor,
-        "moeda": "BRL",
-        "categoria": categoria,
-        "descricao": descr,
-        "pagamento": pagamento,
-        "data_competencia": data_comp,
-        "confianca": float(confianca),
-        "confirmado": "não",
-        "mensagem_original": original_text.strip(),
-    }
+def ask_categoria_ou_origem(to: str, tx: dict):
+    if tx.get("tipo") == "receita":
+        rows = [{"id": f"origem_{o.lower().replace('º','o').replace(' ', '_')}", "title": o} for o in ORIGENS_RECEITA]
+        send_whatsapp_list(
+            to,
+            "Qual a ORIGEM dessa receita?",
+            "Escolher",
+            rows,
+            section_title="Origem",
+        )
+    else:
+        rows = [{"id": f"cat_{c.lower().replace(' ', '_')}", "title": c} for c in CATEGORIAS_DESPESA]
+        send_whatsapp_list(
+            to,
+            "Qual a CATEGORIA dessa despesa?",
+            "Escolher",
+            rows,
+            section_title="Categoria",
+        )
 
-def normalize_valor_sign(tx: dict):
-    # gasto negativo, receita positivo
-    if tx.get("valor") is None:
-        return
-    v = float(tx["valor"])
-    if tx.get("tipo") == "gasto":
-        tx["valor"] = -abs(v)
-    elif tx.get("tipo") == "receita":
-        tx["valor"] = abs(v)
+def ask_pagamento(to: str):
+    rows = [{"id": f"pay_{p.replace('é','e').replace('í','i')}", "title": p} for p in PAGAMENTOS]
+    send_whatsapp_list(
+        to,
+        "Como foi o pagamento?",
+        "Escolher",
+        rows,
+        section_title="Pagamento",
+    )
+
+def ask_data(to: str):
+    # botões (máx 3) -> Hoje / Ontem / Outra
+    send_whatsapp_buttons(
+        to,
+        "Qual a data de competência?",
+        [
+            {"id": "data_hoje", "title": "Hoje"},
+            {"id": "data_ontem", "title": "Ontem"},
+            {"id": "data_outra", "title": "Outra"},
+        ],
+    )
+
+def ask_confirm(to: str, tx: dict):
+    msg = format_confirm(tx) + "\n\nResponda selecionando:"
+    send_whatsapp_buttons(
+        to,
+        msg,
+        [
+            {"id": "confirm_sim", "title": "SIM"},
+            {"id": "confirm_cancelar", "title": "CANCELAR"},
+        ],
+    )
+
+def ask_text_field(to: str, field: str, tx: dict):
+    if field == "valor":
+        send_whatsapp_text(to, "Qual o VALOR? Ex: 35,90")
+    elif field == "descricao":
+        send_whatsapp_text(to, "Qual a DESCRIÇÃO (curta)? Ex: pão e leite")
+    elif field == "data_competencia":
+        send_whatsapp_text(to, "Digite a data (dd/mm) ou 'hoje' / 'ontem'.")
+    elif field == "categoria":
+        # só cai aqui se usuário escolheu "Outros" e precisa digitar
+        if tx.get("tipo") == "receita":
+            send_whatsapp_text(to, "Digite a ORIGEM (texto). Ex: Salário, PLR, etc.")
+        else:
+            send_whatsapp_text(to, "Digite a CATEGORIA (texto). Ex: Pet, Viagem, etc.")
+    else:
+        send_whatsapp_text(to, "Preciso de uma informação (texto).")
+
+def continue_wizard(to: str, tx: dict):
+    nxt = next_missing(tx)
+    if nxt is None:
+        # normaliza sinal antes de confirmar
+        normalize_sign(tx)
+        ask_confirm(to, tx)
+        return "confirm"
+
+    if nxt == "tipo":
+        ask_tipo(to)
+        return "tipo"
+
+    if nxt == "categoria":
+        ask_categoria_ou_origem(to, tx)
+        return "categoria"
+
+    if nxt == "pagamento":
+        ask_pagamento(to)
+        return "pagamento"
+
+    if nxt == "data_competencia":
+        ask_data(to)
+        return "data"
+
+    # valor / descricao são por texto
+    ask_text_field(to, nxt, tx)
+    return nxt
+
+# ----------------------------
+# Inbound: extrair texto ou seleção
+# ----------------------------
+def extract_inbound(msg: dict):
+    # retorna (kind, value, title)
+    # kind: "text" ou "choice"
+    if msg.get("type") == "interactive" or msg.get("interactive"):
+        inter = msg.get("interactive") or {}
+        itype = inter.get("type")
+        if itype == "button_reply":
+            rep = inter.get("button_reply") or {}
+            return ("choice", rep.get("id"), rep.get("title"))
+        if itype == "list_reply":
+            rep = inter.get("list_reply") or {}
+            return ("choice", rep.get("id"), rep.get("title"))
+        # fallback
+        return ("text", "", "")
+    # texto normal
+    text = (msg.get("text") or {}).get("body", "")
+    return ("text", (text or "").strip(), "")
 
 # ----------------------------
 # Webhook Meta
@@ -339,125 +393,210 @@ async def receive(req: Request):
 
     msg = messages[0]
     from_number = msg.get("from")
-    text = (msg.get("text") or {}).get("body", "").strip()
-    t = text.lower().strip()
 
     # trava opcional: só você
     allowed = os.environ.get("ALLOWED_WA_NUMBER", "").strip()
     if allowed and from_number != allowed:
         return {"ok": True}
 
-    # comando global
-    if t in ["cancelar", "cancela"]:
+    kind, val, title = extract_inbound(msg)
+
+    # comando global cancelar (texto)
+    if kind == "text" and val.lower().strip() in ["cancelar", "cancela"]:
         PENDING.pop(from_number, None)
-        send_whatsapp_text(from_number, "Cancelado.")
+        send_whatsapp_text(from_number, "Cancelado. Mande qualquer mensagem para começar de novo.")
         return {"ok": True}
 
     pending = PENDING.get(from_number)
 
+    # Se NÃO há wizard ativo: sempre inicia
+    if not pending:
+        tx = {
+            "id": str(uuid.uuid4()),
+            "timestamp": now_iso(),
+            "tipo": None,
+            "valor": None,
+            "moeda": "BRL",
+            "categoria": None,
+            "descricao": None,
+            "pagamento": None,
+            "data_competencia": None,
+            "confianca": 0.50,
+            "confirmado": "não",
+            "mensagem_original": (val if kind == "text" else "").strip(),
+        }
+
+        # Se a mensagem inicial tiver valor, aproveita (mas ainda pergunta tipo)
+        if kind == "text":
+            pv = parse_valor(val)
+            if pv is not None:
+                tx["valor"] = pv
+
+        PENDING[from_number] = {"tx": tx, "await": "tipo", "stage": "wizard"}
+        ask_tipo(from_number)
+        return {"ok": True}
+
+    tx = pending["tx"]
+    await_field = pending.get("await")
+
     # -------------------------
-    # estágio: confirmação
+    # CONFIRMAÇÃO
     # -------------------------
-    if pending and pending.get("stage") == "confirm":
-        if t in ["sim", "confirmar", "ok"]:
-            tx = pending["tx"]
+    if await_field == "confirm":
+        if (kind == "choice" and val == "confirm_sim") or (kind == "text" and val.lower().strip() in ["sim", "ok", "confirmar"]):
             tx["confirmado"] = "sim"
-
-            # aplica sinal do valor
-            normalize_valor_sign(tx)
-
-            PENDING.pop(from_number, None)
+            normalize_sign(tx)
             append_row(tx_to_row(tx))
-            send_whatsapp_text(from_number, "Gravado na planilha.")
+            PENDING.pop(from_number, None)
+            send_whatsapp_text(from_number, "Gravado na planilha. Mande qualquer mensagem para registrar outro.")
             return {"ok": True}
 
-        send_whatsapp_text(from_number, "Responda: SIM para gravar ou CANCELAR para descartar.")
+        if (kind == "choice" and val == "confirm_cancelar") or (kind == "text" and val.lower().strip() in ["nao", "não", "cancelar", "cancela"]):
+            PENDING.pop(from_number, None)
+            send_whatsapp_text(from_number, "Cancelado. Mande qualquer mensagem para começar de novo.")
+            return {"ok": True}
+
+        send_whatsapp_text(from_number, "Selecione SIM para gravar ou CANCELAR para descartar.")
         return {"ok": True}
 
     # -------------------------
-    # estágio: coletar faltantes
+    # TIPO (botões)
     # -------------------------
-    if pending and pending.get("stage") == "collect":
-        field = pending.get("await")
-        tx = pending["tx"]
-
-        if field == "tipo":
-            v = normalize_tipo(text)
-            if not v:
-                send_whatsapp_text(from_number, "Tipo inválido. Responda: gasto ou receita.")
-                return {"ok": True}
-            tx["tipo"] = v
-
-        elif field == "valor":
-            v = parse_valor(text)
-            if v is None:
-                send_whatsapp_text(from_number, "Valor inválido. Ex: 35,90")
-                return {"ok": True}
-            tx["valor"] = v
-
-        elif field == "categoria":
-            if tx.get("tipo") == "receita":
-                origem = normalize_origem_receita(text)
-                if not origem:
-                    send_whatsapp_text(
-                        from_number,
-                        "Origem inválida. Use: Salário, Férias, 13º, Bônus, Comissão, PLR, Reembolso, Rendimentos, Freela, Outros."
-                    )
-                    return {"ok": True}
-                tx["categoria"] = origem
-            else:
-                tx["categoria"] = text.strip()
-
-        elif field == "descricao":
-            tx["descricao"] = text.strip()
-
-        elif field == "pagamento":
-            v = normalize_pagamento(text)
-            if not v:
-                send_whatsapp_text(from_number, "Pagamento inválido. Responda: pix / débito / crédito / dinheiro")
-                return {"ok": True}
-            tx["pagamento"] = v
-
-        elif field == "data_competencia":
-            v = normalize_data(text)
-            if not v:
-                send_whatsapp_text(from_number, "Data inválida. Use: hoje / ontem / ou dd/mm (ex: 29/12)")
-                return {"ok": True}
-            tx["data_competencia"] = v
-
-        # se tipo virou gasto e categoria ainda vazia, tenta inferir categoria de despesa do texto original (opcional)
-        if tx.get("tipo") == "gasto" and not tx.get("categoria"):
-            inferred = parse_categoria_despesa(tx.get("mensagem_original", ""))
-            if inferred:
-                tx["categoria"] = inferred
-
-        miss = missing_fields(tx)
-        if miss:
-            next_f = miss[0]
+    if await_field == "tipo":
+        if kind == "choice" and val in ["tipo_receita", "tipo_despesa"]:
+            tx["tipo"] = "receita" if val == "tipo_receita" else "despesa"
             pending["tx"] = tx
-            pending["await"] = next_f
-            send_whatsapp_text(from_number, next_question(next_f, tx))
+            pending["await"] = continue_wizard(from_number, tx)
             return {"ok": True}
 
-        # tudo completo -> confirmação
+        send_whatsapp_text(from_number, "Use os botões para escolher: Receita ou Despesa.")
+        ask_tipo(from_number)
+        return {"ok": True}
+
+    # -------------------------
+    # CATEGORIA/ORIGEM (lista)
+    # -------------------------
+    if await_field == "categoria":
+        if kind == "choice" and val:
+            if tx.get("tipo") == "receita":
+                # origem_...
+                if val.startswith("origem_"):
+                    tx["categoria"] = title or "Outros"
+            else:
+                # cat_...
+                if val.startswith("cat_"):
+                    tx["categoria"] = title or "Outros"
+
+            # Se escolheu "Outros", peça texto específico
+            if (tx.get("categoria") or "").lower() == "outros":
+                pending["tx"] = tx
+                pending["await"] = "categoria_texto"
+                ask_text_field(from_number, "categoria", tx)
+                return {"ok": True}
+
+            pending["tx"] = tx
+            pending["await"] = continue_wizard(from_number, tx)
+            return {"ok": True}
+
+        send_whatsapp_text(from_number, "Escolha uma opção na lista.")
+        ask_categoria_ou_origem(from_number, tx)
+        return {"ok": True}
+
+    # Categoria/Origem digitada quando escolheu "Outros"
+    if await_field == "categoria_texto":
+        if kind != "text" or not val.strip():
+            ask_text_field(from_number, "categoria", tx)
+            return {"ok": True}
+        tx["categoria"] = val.strip()
         pending["tx"] = tx
-        pending["stage"] = "confirm"
-        pending["await"] = None
-        send_whatsapp_text(from_number, format_confirm(tx))
+        pending["await"] = continue_wizard(from_number, tx)
         return {"ok": True}
 
     # -------------------------
-    # novo lançamento
+    # VALOR (texto)
     # -------------------------
-    tx = init_tx(text)
-    miss = missing_fields(tx)
-
-    if miss:
-        PENDING[from_number] = {"tx": tx, "stage": "collect", "await": miss[0]}
-        send_whatsapp_text(from_number, next_question(miss[0], tx))
+    if await_field == "valor":
+        if kind != "text":
+            ask_text_field(from_number, "valor", tx)
+            return {"ok": True}
+        v = parse_valor(val)
+        if v is None:
+            send_whatsapp_text(from_number, "Valor inválido. Ex: 35,90")
+            ask_text_field(from_number, "valor", tx)
+            return {"ok": True}
+        tx["valor"] = v
+        pending["tx"] = tx
+        pending["await"] = continue_wizard(from_number, tx)
         return {"ok": True}
 
-    # completo -> confirmação
-    PENDING[from_number] = {"tx": tx, "stage": "confirm", "await": None}
-    send_whatsapp_text(from_number, format_confirm(tx))
+    # -------------------------
+    # DESCRIÇÃO (texto)
+    # -------------------------
+    if await_field == "descricao":
+        if kind != "text" or not val.strip():
+            ask_text_field(from_number, "descricao", tx)
+            return {"ok": True}
+        tx["descricao"] = val.strip()
+        pending["tx"] = tx
+        pending["await"] = continue_wizard(from_number, tx)
+        return {"ok": True}
+
+    # -------------------------
+    # PAGAMENTO (lista)
+    # -------------------------
+    if await_field == "pagamento":
+        if kind == "choice" and val and val.startswith("pay_"):
+            tx["pagamento"] = title.lower().strip() if title else "desconhecido"
+            pending["tx"] = tx
+            pending["await"] = continue_wizard(from_number, tx)
+            return {"ok": True}
+
+        send_whatsapp_text(from_number, "Escolha uma opção na lista de pagamento.")
+        ask_pagamento(from_number)
+        return {"ok": True}
+
+    # -------------------------
+    # DATA (botões Hoje/Ontem/Outra)
+    # -------------------------
+    if await_field == "data":
+        if kind == "choice" and val in ["data_hoje", "data_ontem", "data_outra"]:
+            if val == "data_hoje":
+                tx["data_competencia"] = today_iso()
+                pending["tx"] = tx
+                pending["await"] = continue_wizard(from_number, tx)
+                return {"ok": True}
+
+            if val == "data_ontem":
+                tx["data_competencia"] = (dt.date.today() - dt.timedelta(days=1)).isoformat()
+                pending["tx"] = tx
+                pending["await"] = continue_wizard(from_number, tx)
+                return {"ok": True}
+
+            # outra -> pede texto
+            pending["tx"] = tx
+            pending["await"] = "data_texto"
+            ask_text_field(from_number, "data_competencia", tx)
+            return {"ok": True}
+
+        send_whatsapp_text(from_number, "Use os botões: Hoje / Ontem / Outra.")
+        ask_data(from_number)
+        return {"ok": True}
+
+    if await_field == "data_texto":
+        if kind != "text" or not val.strip():
+            ask_text_field(from_number, "data_competencia", tx)
+            return {"ok": True}
+        d = parse_data(val.strip())
+        if not d:
+            send_whatsapp_text(from_number, "Data inválida. Use hoje/ontem ou dd/mm (ex: 29/12).")
+            ask_text_field(from_number, "data_competencia", tx)
+            return {"ok": True}
+        tx["data_competencia"] = d
+        pending["tx"] = tx
+        pending["await"] = continue_wizard(from_number, tx)
+        return {"ok": True}
+
+    # fallback: se algo ficou fora de sincronia, continua wizard
+    pending["tx"] = tx
+    pending["await"] = continue_wizard(from_number, tx)
     return {"ok": True}
