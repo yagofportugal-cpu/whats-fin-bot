@@ -3,6 +3,7 @@ import re
 import uuid
 import datetime as dt
 import requests
+import unicodedata
 from collections import defaultdict
 
 from fastapi import FastAPI, Request, Response
@@ -17,7 +18,8 @@ app = FastAPI()
 GRAPH_VER = "v22.0"
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
-PENDING = {}  # {from: {"tx": {...}, "await": "...", "stage": "..."}}
+# Estado por número: {"tx": {...}, "await": "...", "stage": "..."}
+PENDING = {}
 
 ORIGENS_RECEITA = [
     "Salário", "Férias", "13º", "Bônus", "Comissão", "PLR",
@@ -27,16 +29,14 @@ CATEGORIAS_DESPESA = [
     "Mercado", "Transporte", "Moradia", "Alimentação", "Assinaturas",
     "Saúde", "Lazer", "Educação", "Impostos", "Outros"
 ]
-
 PAGAMENTOS_DESPESA = ["pix", "débito", "crédito", "dinheiro", "desconhecido"]
 
 MSG_SALVO = "Show, já registrei aqui no nosso BD, quando tiver mais alguma movimentação me sinalize aqui!"
-
 TXT_INICIAL = "Olá, bora conferir saldos hoje ou você quer registrar algo?"
 
-# ----------------------------
-# WhatsApp send
-# ----------------------------
+# =========================================================
+# WhatsApp: envio
+# =========================================================
 def wa_url():
     phone_number_id = os.environ["WA_PHONE_NUMBER_ID"]
     return f"https://graph.facebook.com/{GRAPH_VER}/{phone_number_id}/messages"
@@ -99,17 +99,21 @@ def send_whatsapp_list(to: str, body_text: str, button_label: str, rows: list, s
         },
     })
 
-# ----------------------------
+# =========================================================
 # Google Sheets
-# ----------------------------
+# =========================================================
 def _sheets_service():
     creds_path = os.environ["GOOGLE_APPLICATION_CREDENTIALS"]
     creds = Credentials.from_service_account_file(creds_path, scopes=SCOPES)
     return build("sheets", "v4", credentials=creds)
 
 def append_row(values: list):
+    """
+    Append no range definido. Importante: o range deve apontar para a aba correta.
+    Recomendado no Render: GOOGLE_SHEETS_RANGE = SuaAba!A1:L
+    """
     spreadsheet_id = os.environ["GOOGLE_SHEETS_SPREADSHEET_ID"]
-    rng = os.environ.get("GOOGLE_SHEETS_RANGE", "lancamentos!A1")
+    rng = os.environ.get("GOOGLE_SHEETS_RANGE", "lancamentos!A1:L")
     svc = _sheets_service()
     body = {"values": [values]}
     return (
@@ -125,32 +129,61 @@ def append_row(values: list):
         .execute()
     )
 
+def _norm_header(h: str) -> str:
+    """
+    Normaliza header do Sheets para chaves internas:
+    - lower
+    - remove acentos
+    - corta em '(' para remover explicações do header
+    - troca espaços por underscore
+    Exemplos:
+      "TIPO" -> "tipo"
+      "DESCRIÇÃO" -> "descricao"
+      "pagamento (pix/...)" -> "pagamento"
+      "Data" -> "data"
+    """
+    s = (h or "").strip()
+    s = s.split("(")[0].strip()
+    s = s.lower()
+    s = "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
+    s = re.sub(r"\s+", "_", s)
+    s = re.sub(r"[^a-z0-9_]", "", s)
+    return s
+
 def read_all_rows():
     """
-    Lê a planilha inteira e retorna lista de dicts.
-    Pressupõe header na primeira linha com nomes:
+    Lê a planilha e devolve lista de dicts com chaves NORMALIZADAS:
     id,timestamp,tipo,valor,moeda,categoria,descricao,pagamento,data,confianca,confirmado,mensagem_original
     """
     spreadsheet_id = os.environ["GOOGLE_SHEETS_SPREADSHEET_ID"]
-    rng = os.environ.get("GOOGLE_SHEETS_READ_RANGE") or os.environ.get("GOOGLE_SHEETS_RANGE", "lancamentos!A1")
+    rng = os.environ.get("GOOGLE_SHEETS_READ_RANGE") or os.environ.get("GOOGLE_SHEETS_RANGE", "lancamentos!A1:L")
     svc = _sheets_service()
     res = svc.spreadsheets().values().get(spreadsheetId=spreadsheet_id, range=rng).execute()
     values = res.get("values") or []
+
+    # Debug (mantém; ajuda quando der ruim)
+    print("READ_RANGE =", rng)
+    print("ROWS_READ  =", len(values))
+    print("HEADERS_RAW=", values[0] if values else "EMPTY")
+
     if not values or len(values) < 2:
         return []
 
-    headers = [h.strip() for h in values[0]]
+    headers = [_norm_header(h) for h in values[0]]
     rows = []
     for line in values[1:]:
         row = {}
         for i, h in enumerate(headers):
             row[h] = line[i] if i < len(line) else ""
         rows.append(row)
+
+    print("HEADERS_NORM=", headers)
+    print("SAMPLE_ROW  =", rows[0] if rows else "NO_DATA")
     return rows
 
-# ----------------------------
+# =========================================================
 # Helpers
-# ----------------------------
+# =========================================================
 def now_iso():
     return dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
@@ -158,7 +191,7 @@ def today_iso():
     return dt.date.today().isoformat()
 
 def parse_valor(text: str):
-    t = text.lower()
+    t = (text or "").lower()
     m = re.search(r"(\d{1,9}(?:[.,]\d{2})?)", t)
     if not m:
         return None
@@ -169,7 +202,7 @@ def parse_valor(text: str):
         return None
 
 def parse_data(text: str):
-    t = text.lower().strip()
+    t = (text or "").lower().strip()
     if t == "hoje":
         return dt.date.today().isoformat()
     if t == "ontem":
@@ -202,6 +235,7 @@ def normalize_sign(tx: dict):
         tx["valor"] = abs(v)
 
 def ensure_receita_descricao(tx: dict):
+    # Receita não pergunta descrição; preenche automático para manter coluna consistente
     if tx.get("tipo") != "receita":
         return
     if tx.get("descricao") and str(tx["descricao"]).strip():
@@ -216,19 +250,23 @@ def ensure_receita_descricao(tx: dict):
         tx["descricao"] = "Receita"
 
 def tx_to_row(tx: dict):
+    """
+    Grava na ordem do SEU header (normalizado):
+    ID, TIMESTAMP, TIPO, VALOR, MOEDA, CATEGORIA, DESCRIÇÃO, pagamento..., Data, confianca..., confirmado..., mensagem_original...
+    """
     return [
-        tx["id"],
-        tx["timestamp"],
-        tx["tipo"],
-        tx["valor"],
-        tx["moeda"],
-        tx["categoria"],
-        tx["descricao"],
-        tx["pagamento"],
-        tx["data"],
-        tx["confianca"],
-        tx["confirmado"],
-        tx["mensagem_original"],
+        tx.get("id", ""),
+        tx.get("timestamp", ""),
+        tx.get("tipo", ""),
+        tx.get("valor", ""),
+        tx.get("moeda", "BRL"),
+        tx.get("categoria", ""),
+        tx.get("descricao", ""),
+        tx.get("pagamento", ""),
+        tx.get("data", ""),
+        tx.get("confianca", ""),
+        tx.get("confirmado", ""),
+        tx.get("mensagem_original", ""),
     ]
 
 def format_confirm(tx: dict):
@@ -258,9 +296,9 @@ def next_missing(tx: dict):
             return f
     return None
 
-# ----------------------------
-# Wizard: telas
-# ----------------------------
+# =========================================================
+# Wizard / telas
+# =========================================================
 def ask_inicio(to: str):
     send_whatsapp_buttons(
         to,
@@ -317,7 +355,7 @@ def ask_confirm(to: str, tx: dict):
     )
 
 def ask_resumo_periodo(to: str):
-    # 3 botões + lista para 12 meses (limitação de 3 botões)
+    # Botões limitados a 3; 12 meses fica na lista abaixo
     send_whatsapp_buttons(
         to,
         "Qual resumo você quer ver?",
@@ -327,7 +365,6 @@ def ask_resumo_periodo(to: str):
             {"id": "res_mensal", "title": "Mensal"},
         ],
     )
-    # e em seguida, manda lista com 12 meses (ou você pode mandar apenas se pedir)
     rows = [{"id": "res_12m", "title": "12 meses", "description": "Últimos 12 meses"}]
     send_whatsapp_list(to, "Ou escolha:", "Abrir", rows, section_title="Outros")
 
@@ -372,27 +409,62 @@ def continue_wizard(to: str, tx: dict):
     ask_text_field(to, nxt, tx)
     return nxt
 
-# ----------------------------
+# =========================================================
 # Resumo: cálculo
-# ----------------------------
+# =========================================================
 def _to_float(v):
     if v is None:
         return 0.0
     s = str(v).strip()
     if not s:
         return 0.0
-    s = s.replace(".", "").replace(",", ".")
+    # aceita "1.234,56" e "1234.56"
+    if "," in s and "." in s:
+        s = s.replace(".", "").replace(",", ".")
+    else:
+        s = s.replace(",", ".")
     try:
         return float(s)
     except:
         return 0.0
 
-def _parse_iso_date(v):
-    # data esperado YYYY-MM-DD
-    try:
-        return dt.date.fromisoformat(str(v)[:10])
-    except:
+def _parse_date_any(v):
+    """
+    Aceita:
+    - YYYY-MM-DD
+    - DD/MM/YYYY
+    - DD/MM
+    """
+    if v is None:
         return None
+    s = str(v).strip()
+    if not s:
+        return None
+
+    # ISO direto
+    try:
+        return dt.date.fromisoformat(s[:10])
+    except:
+        pass
+
+    # dd/mm(/aaaa)
+    m = re.search(r"\b(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?\b", s)
+    if m:
+        d = int(m.group(1))
+        mo = int(m.group(2))
+        y = m.group(3)
+        if y is None:
+            y = dt.date.today().year
+        else:
+            y = int(y)
+            if y < 100:
+                y += 2000
+        try:
+            return dt.date(y, mo, d)
+        except:
+            return None
+
+    return None
 
 def get_period_range(kind: str):
     today = dt.date.today()
@@ -403,7 +475,6 @@ def get_period_range(kind: str):
     elif kind == "mensal":
         start = today.replace(day=1)
     elif kind == "12m":
-        # últimos 365 dias
         start = today - dt.timedelta(days=364)
     else:
         start = today
@@ -418,12 +489,12 @@ def build_resumo_text(kind: str):
 
     total_rec = 0.0
     total_des = 0.0
-
     rec_by_cat = defaultdict(float)
     des_by_cat = defaultdict(float)
 
     for r in rows:
-        d = _parse_iso_date(r.get("Data"))
+        # headers já normalizados: data, tipo, valor, categoria
+        d = _parse_date_any(r.get("data"))
         if not d:
             continue
         if d < start or d > end:
@@ -433,17 +504,15 @@ def build_resumo_text(kind: str):
         cat = (r.get("categoria") or "Sem categoria").strip() or "Sem categoria"
         val = _to_float(r.get("valor"))
 
-        # seu modelo: receita positivo, despesa negativo
         if tipo == "receita":
             total_rec += abs(val)
             rec_by_cat[cat] += abs(val)
         elif tipo == "despesa":
-            total_des += abs(val)  # abs para mostrar total de gasto
+            total_des += abs(val)
             des_by_cat[cat] += abs(val)
 
     saldo = total_rec - total_des
 
-    # ordenar top categorias
     rec_top = sorted(rec_by_cat.items(), key=lambda x: x[1], reverse=True)[:8]
     des_top = sorted(des_by_cat.items(), key=lambda x: x[1], reverse=True)[:8]
 
@@ -475,9 +544,9 @@ def build_resumo_text(kind: str):
 
     return "\n".join(lines)
 
-# ----------------------------
+# =========================================================
 # Inbound parse
-# ----------------------------
+# =========================================================
 def extract_inbound(msg: dict):
     if msg.get("type") == "interactive" or msg.get("interactive"):
         inter = msg.get("interactive") or {}
@@ -492,9 +561,9 @@ def extract_inbound(msg: dict):
     text = (msg.get("text") or {}).get("body", "")
     return ("text", (text or "").strip(), "")
 
-# ----------------------------
-# Webhook
-# ----------------------------
+# =========================================================
+# Webhook Meta
+# =========================================================
 @app.get("/")
 def home():
     return {"status": "ok"}
@@ -537,7 +606,7 @@ async def receive(req: Request):
 
     pending = PENDING.get(from_number)
 
-    # Se NÃO há wizard ativo: inicia menu inicial
+    # Se não há estado: mostra menu inicial
     if not pending:
         PENDING[from_number] = {"tx": None, "await": "inicio", "stage": "menu"}
         ask_inicio(from_number)
@@ -562,8 +631,8 @@ async def receive(req: Request):
                 "moeda": "BRL",
                 "categoria": None,     # origem
                 "descricao": None,     # auto
-                "pagamento": None,     # recebimento (pix/dinheiro)
-                "Data": None,
+                "pagamento": None,     # recebimento
+                "data": None,
                 "confianca": 0.60,
                 "confirmado": "não",
                 "mensagem_original": "",
@@ -582,7 +651,7 @@ async def receive(req: Request):
                 "categoria": None,
                 "descricao": None,
                 "pagamento": None,
-                "Data": None,
+                "data": None,
                 "confianca": 0.60,
                 "confirmado": "não",
                 "mensagem_original": "",
@@ -609,37 +678,34 @@ async def receive(req: Request):
             return {"ok": True}
 
         if val == "res_diario":
-            txt = build_resumo_text("diario")
-            send_whatsapp_text(from_number, txt)
+            send_whatsapp_text(from_number, build_resumo_text("diario"))
             PENDING.pop(from_number, None)
             return {"ok": True}
 
         if val == "res_semanal":
-            txt = build_resumo_text("semanal")
-            send_whatsapp_text(from_number, txt)
+            send_whatsapp_text(from_number, build_resumo_text("semanal"))
             PENDING.pop(from_number, None)
             return {"ok": True}
 
         if val == "res_mensal":
-            txt = build_resumo_text("mensal")
-            send_whatsapp_text(from_number, txt)
+            send_whatsapp_text(from_number, build_resumo_text("mensal"))
             PENDING.pop(from_number, None)
             return {"ok": True}
 
         if val == "res_12m":
-            txt = build_resumo_text("12m")
-            send_whatsapp_text(from_number, txt)
+            send_whatsapp_text(from_number, build_resumo_text("12m"))
             PENDING.pop(from_number, None)
             return {"ok": True}
 
         ask_resumo_periodo(from_number)
         return {"ok": True}
 
-    # daqui pra frente: fluxo de lançamento (wizard)
+    # -------------------------
+    # FLUXO DE LANÇAMENTO
+    # -------------------------
     tx = pending.get("tx") or {}
-    # -------------------------
-    # CONFIRMAÇÃO
-    # -------------------------
+
+    # CONFIRMAR
     if await_field == "confirm":
         if (kind == "choice" and val == "confirm_sim") or (kind == "text" and val.lower().strip() in ["sim", "ok", "confirmar"]):
             tx["confirmado"] = "sim"
@@ -658,9 +724,7 @@ async def receive(req: Request):
         send_whatsapp_text(from_number, "Selecione SIM para gravar ou CANCELAR para descartar.")
         return {"ok": True}
 
-    # -------------------------
-    # CATEGORIA / ORIGEM
-    # -------------------------
+    # CATEGORIA/ORIGEM
     if await_field == "categoria":
         if kind == "choice" and val:
             if tx.get("tipo") == "receita":
@@ -693,9 +757,7 @@ async def receive(req: Request):
         pending["await"] = continue_wizard(from_number, tx)
         return {"ok": True}
 
-    # -------------------------
-    # VALOR (texto)
-    # -------------------------
+    # VALOR
     if await_field == "valor":
         if kind != "text":
             ask_text_field(from_number, "valor", tx)
@@ -710,9 +772,7 @@ async def receive(req: Request):
         pending["await"] = continue_wizard(from_number, tx)
         return {"ok": True}
 
-    # -------------------------
     # DESCRIÇÃO (apenas despesa)
-    # -------------------------
     if await_field == "descricao":
         if kind != "text" or not val.strip():
             ask_text_field(from_number, "descricao", tx)
@@ -722,9 +782,7 @@ async def receive(req: Request):
         pending["await"] = continue_wizard(from_number, tx)
         return {"ok": True}
 
-    # -------------------------
     # PAGAMENTO (despesa)
-    # -------------------------
     if await_field == "pagamento":
         if kind == "choice" and val and val.startswith("pay_"):
             tx["pagamento"] = (title or "desconhecido").lower().strip()
@@ -735,9 +793,7 @@ async def receive(req: Request):
         ask_pagamento_despesa(from_number)
         return {"ok": True}
 
-    # -------------------------
     # RECEBIMENTO (receita)
-    # -------------------------
     if await_field == "recebimento":
         if kind == "choice" and val in ["rec_dinheiro", "rec_pix"]:
             tx["pagamento"] = "dinheiro" if val == "rec_dinheiro" else "pix"
@@ -748,45 +804,43 @@ async def receive(req: Request):
         ask_recebimento_receita(from_number)
         return {"ok": True}
 
-    # -------------------------
     # DATA
-    # -------------------------
     if await_field == "data":
         if kind == "choice" and val in ["data_hoje", "data_ontem", "data_outra"]:
             if val == "data_hoje":
-                tx["Data"] = today_iso()
+                tx["data"] = today_iso()
                 pending["tx"] = tx
                 pending["await"] = continue_wizard(from_number, tx)
                 return {"ok": True}
             if val == "data_ontem":
-                tx["Data"] = (dt.date.today() - dt.timedelta(days=1)).isoformat()
+                tx["data"] = (dt.date.today() - dt.timedelta(days=1)).isoformat()
                 pending["tx"] = tx
                 pending["await"] = continue_wizard(from_number, tx)
                 return {"ok": True}
             pending["tx"] = tx
             pending["await"] = "data_texto"
-            ask_text_field(from_number, "Data", tx)
+            ask_text_field(from_number, "data", tx)
             return {"ok": True}
+
         send_whatsapp_text(from_number, "Use os botões: Hoje / Ontem / Outra.")
         ask_data(from_number)
         return {"ok": True}
 
     if await_field == "data_texto":
         if kind != "text" or not val.strip():
-            ask_text_field(from_number, "Data", tx)
+            ask_text_field(from_number, "data", tx)
             return {"ok": True}
         d = parse_data(val.strip())
         if not d:
             send_whatsapp_text(from_number, "Data inválida. Use hoje/ontem ou dd/mm (ex: 29/12).")
-            ask_text_field(from_number, "Data", tx)
+            ask_text_field(from_number, "data", tx)
             return {"ok": True}
-        tx["Data"] = d
+        tx["data"] = d
         pending["tx"] = tx
         pending["await"] = continue_wizard(from_number, tx)
         return {"ok": True}
 
-    # fallback
+    # fallback: tenta continuar wizard
     pending["tx"] = tx
     pending["await"] = continue_wizard(from_number, tx)
     return {"ok": True}
-
