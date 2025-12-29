@@ -355,7 +355,7 @@ def ask_confirm(to: str, tx: dict):
     )
 
 def ask_resumo_periodo(to: str):
-    # Botões limitados a 3; 12 meses fica na lista abaixo
+    # 3 botões (limite do WhatsApp)
     send_whatsapp_buttons(
         to,
         "Qual resumo você quer ver?",
@@ -365,8 +365,14 @@ def ask_resumo_periodo(to: str):
             {"id": "res_mensal", "title": "Mensal"},
         ],
     )
-    rows = [{"id": "res_12m", "title": "12 meses", "description": "Últimos 12 meses"}]
-    send_whatsapp_list(to, "Ou escolha:", "Abrir", rows, section_title="Outros")
+
+    # Lista “Outros” com mais opções
+    rows = [
+        {"id": "res_3m", "title": "3 meses", "description": "Últimos 3 meses"},
+        {"id": "res_6m", "title": "6 meses", "description": "Últimos 6 meses"},
+        {"id": "res_12m", "title": "12 meses", "description": "Últimos 12 meses"},
+    ]
+    send_whatsapp_list(to, "Ou escolha em Outros:", "Abrir", rows, section_title="Outros")
 
 def ask_text_field(to: str, field: str, tx: dict):
     if field == "valor":
@@ -468,16 +474,28 @@ def _parse_date_any(v):
 
 def get_period_range(kind: str):
     today = dt.date.today()
+
     if kind == "diario":
         start = today
+
     elif kind == "semanal":
         start = today - dt.timedelta(days=6)
+
     elif kind == "mensal":
         start = today.replace(day=1)
+
+    elif kind == "3m":
+        start = today - dt.timedelta(days=90)
+
+    elif kind == "6m":
+        start = today - dt.timedelta(days=182)
+
     elif kind == "12m":
         start = today - dt.timedelta(days=364)
+
     else:
         start = today
+
     return start, today
 
 def build_resumo_text(kind: str):
@@ -493,7 +511,6 @@ def build_resumo_text(kind: str):
     des_by_cat = defaultdict(float)
 
     for r in rows:
-        # headers já normalizados: data, tipo, valor, categoria
         d = _parse_date_any(r.get("data"))
         if not d:
             continue
@@ -511,36 +528,48 @@ def build_resumo_text(kind: str):
             total_des += abs(val)
             des_by_cat[cat] += abs(val)
 
-    saldo = total_rec - total_des
-
+    # ordenar top categorias
     rec_top = sorted(rec_by_cat.items(), key=lambda x: x[1], reverse=True)[:8]
     des_top = sorted(des_by_cat.items(), key=lambda x: x[1], reverse=True)[:8]
 
     def fmt_money(x):
         return f"{x:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
-    label = {"diario": "Diário", "semanal": "Semanal", "mensal": "Mensal", "12m": "Últimos 12 meses"}.get(kind, kind)
+    def fmt_date_br(d: dt.date):
+        return d.strftime("%d/%m/%Y")
+
+    label = {"diario": "Diário", "semanal": "Semanal", "mensal": "Mensal", "3m": "3 meses", "6m": "6 meses", "12m": "12 meses", }.get(kind, kind)
+
+    saldo = total_rec - total_des
+    pct = (total_des / total_rec * 100.0) if total_rec > 0 else 0.0
 
     lines = []
-    lines.append(f"Resumo {label} ({start.isoformat()} a {end.isoformat()})")
+    lines.append(f"*Resumo {label}*")
+    lines.append(f"Período: {fmt_date_br(start)} a {fmt_date_br(end)}")
     lines.append("")
-    lines.append(f"Receitas: +R$ {fmt_money(total_rec)}")
-    lines.append(f"Despesas: -R$ {fmt_money(total_des)}")
-    lines.append(f"Saldo:   R$ {fmt_money(saldo)}")
-    lines.append("")
-    lines.append("Receitas por origem (top):")
+
+    lines.append("*Receitas por origem*")
     if rec_top:
         for c, v in rec_top:
             lines.append(f"- {c}: R$ {fmt_money(v)}")
     else:
         lines.append("- (sem receitas no período)")
     lines.append("")
-    lines.append("Despesas por categoria (top):")
+
+    lines.append("*Despesas por categoria*")
     if des_top:
         for c, v in des_top:
             lines.append(f"- {c}: R$ {fmt_money(v)}")
     else:
         lines.append("- (sem despesas no período)")
+    lines.append("")
+    lines.append("")
+
+    lines.append(f"Receitas: +R$ {fmt_money(total_rec)}")
+    lines.append(f"Despesas: -R$ {fmt_money(total_des)}")
+    lines.append(f"Saldo:   R$ {fmt_money(saldo)}")
+    lines.append("")
+    lines.append(f"Neste período suas despesas equivaleram a {pct:.1f}% sobre suas receitas.")
 
     return "\n".join(lines)
 
@@ -689,6 +718,16 @@ async def receive(req: Request):
 
         if val == "res_mensal":
             send_whatsapp_text(from_number, build_resumo_text("mensal"))
+            PENDING.pop(from_number, None)
+            return {"ok": True}
+
+        if val == "res_3m":
+            send_whatsapp_text(from_number, build_resumo_text("3m"))
+            PENDING.pop(from_number, None)
+            return {"ok": True}
+
+        if val == "res_6m":
+            send_whatsapp_text(from_number, build_resumo_text("6m"))
             PENDING.pop(from_number, None)
             return {"ok": True}
 
@@ -844,3 +883,4 @@ async def receive(req: Request):
     pending["tx"] = tx
     pending["await"] = continue_wizard(from_number, tx)
     return {"ok": True}
+
