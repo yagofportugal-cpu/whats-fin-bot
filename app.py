@@ -65,3 +65,53 @@ async def receive(req: Request):
     send_whatsapp_text(from_number, f"Recebi: {text}")
 
     return {"ok": True}
+from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
+import datetime as dt
+import uuid
+
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+
+def _sheets_service():
+    creds_path = os.environ["GOOGLE_APPLICATION_CREDENTIALS"]
+    creds = Credentials.from_service_account_file(creds_path, scopes=SCOPES)
+    return build("sheets", "v4", credentials=creds)
+
+def append_row(values):
+    spreadsheet_id = os.environ["GOOGLE_SHEETS_SPREADSHEET_ID"]
+    rng = os.environ.get("GOOGLE_SHEETS_RANGE", "lancamentos!A1")
+    svc = _sheets_service()
+    body = {"values": [values]}
+    return (
+        svc.spreadsheets()
+        .values()
+        .append(
+            spreadsheetId=spreadsheet_id,
+            range=rng,
+            valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",
+            body=body,
+        )
+        .execute()
+    )
+
+@app.get("/test-sheets")
+def test_sheets():
+    now = dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    row = [
+        str(uuid.uuid4()),
+        now,
+        "gasto",
+        1.23,
+        "BRL",
+        "Teste",
+        "linha teste",
+        "desconhecido",
+        dt.date.today().isoformat(),
+        0.99,
+        "sim",
+        "teste-sheets"
+    ]
+    append_row(row)
+    return {"ok": True}
+
