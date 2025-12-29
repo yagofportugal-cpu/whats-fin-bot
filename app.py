@@ -129,7 +129,7 @@ def read_all_rows():
     """
     Lê a planilha inteira e retorna lista de dicts.
     Pressupõe header na primeira linha com nomes:
-    id,timestamp,tipo,valor,moeda,categoria,descricao,pagamento,data_competencia,confianca,confirmado,mensagem_original
+    id,timestamp,tipo,valor,moeda,categoria,descricao,pagamento,data,confianca,confirmado,mensagem_original
     """
     spreadsheet_id = os.environ["GOOGLE_SHEETS_SPREADSHEET_ID"]
     rng = os.environ.get("GOOGLE_SHEETS_READ_RANGE") or os.environ.get("GOOGLE_SHEETS_RANGE", "lancamentos!A1")
@@ -225,7 +225,7 @@ def tx_to_row(tx: dict):
         tx["categoria"],
         tx["descricao"],
         tx["pagamento"],
-        tx["data_competencia"],
+        tx["data"],
         tx["confianca"],
         tx["confirmado"],
         tx["mensagem_original"],
@@ -242,11 +242,11 @@ def format_confirm(tx: dict):
         f"- valor: {sinal}{v} {tx.get('moeda','BRL')}\n"
         f"- {label_cat}: {tx.get('categoria')}\n"
         f"- {label_pay}: {tx.get('pagamento')}\n"
-        f"- data_competencia: {tx.get('data_competencia')}\n"
+        f"- data: {tx.get('data')}\n"
     )
 
 def required_fields(tx: dict):
-    base = ["tipo", "valor", "categoria", "pagamento", "data_competencia"]
+    base = ["tipo", "valor", "categoria", "pagamento", "data"]
     if tx.get("tipo") == "despesa":
         base.insert(3, "descricao")
     return base
@@ -336,7 +336,7 @@ def ask_text_field(to: str, field: str, tx: dict):
         send_whatsapp_text(to, "Qual o VALOR? Ex: 35,90")
     elif field == "descricao":
         send_whatsapp_text(to, "Qual a DESCRIÇÃO (curta)? Ex: pão e leite")
-    elif field == "data_competencia":
+    elif field == "data":
         send_whatsapp_text(to, "Digite a data (dd/mm) ou 'hoje' / 'ontem'.")
     elif field == "categoria":
         if tx.get("tipo") == "receita":
@@ -365,7 +365,7 @@ def continue_wizard(to: str, tx: dict):
         ask_pagamento_despesa(to)
         return "pagamento"
 
-    if nxt == "data_competencia":
+    if nxt == "data":
         ask_data(to)
         return "data"
 
@@ -388,7 +388,7 @@ def _to_float(v):
         return 0.0
 
 def _parse_iso_date(v):
-    # data_competencia esperado YYYY-MM-DD
+    # data esperado YYYY-MM-DD
     try:
         return dt.date.fromisoformat(str(v)[:10])
     except:
@@ -423,7 +423,7 @@ def build_resumo_text(kind: str):
     des_by_cat = defaultdict(float)
 
     for r in rows:
-        d = _parse_iso_date(r.get("data_competencia"))
+        d = _parse_iso_date(r.get("Data"))
         if not d:
             continue
         if d < start or d > end:
@@ -563,7 +563,7 @@ async def receive(req: Request):
                 "categoria": None,     # origem
                 "descricao": None,     # auto
                 "pagamento": None,     # recebimento (pix/dinheiro)
-                "data_competencia": None,
+                "Data": None,
                 "confianca": 0.60,
                 "confirmado": "não",
                 "mensagem_original": "",
@@ -582,7 +582,7 @@ async def receive(req: Request):
                 "categoria": None,
                 "descricao": None,
                 "pagamento": None,
-                "data_competencia": None,
+                "Data": None,
                 "confianca": 0.60,
                 "confirmado": "não",
                 "mensagem_original": "",
@@ -754,18 +754,18 @@ async def receive(req: Request):
     if await_field == "data":
         if kind == "choice" and val in ["data_hoje", "data_ontem", "data_outra"]:
             if val == "data_hoje":
-                tx["data_competencia"] = today_iso()
+                tx["Data"] = today_iso()
                 pending["tx"] = tx
                 pending["await"] = continue_wizard(from_number, tx)
                 return {"ok": True}
             if val == "data_ontem":
-                tx["data_competencia"] = (dt.date.today() - dt.timedelta(days=1)).isoformat()
+                tx["Data"] = (dt.date.today() - dt.timedelta(days=1)).isoformat()
                 pending["tx"] = tx
                 pending["await"] = continue_wizard(from_number, tx)
                 return {"ok": True}
             pending["tx"] = tx
             pending["await"] = "data_texto"
-            ask_text_field(from_number, "data_competencia", tx)
+            ask_text_field(from_number, "Data", tx)
             return {"ok": True}
         send_whatsapp_text(from_number, "Use os botões: Hoje / Ontem / Outra.")
         ask_data(from_number)
@@ -773,14 +773,14 @@ async def receive(req: Request):
 
     if await_field == "data_texto":
         if kind != "text" or not val.strip():
-            ask_text_field(from_number, "data_competencia", tx)
+            ask_text_field(from_number, "Data", tx)
             return {"ok": True}
         d = parse_data(val.strip())
         if not d:
             send_whatsapp_text(from_number, "Data inválida. Use hoje/ontem ou dd/mm (ex: 29/12).")
-            ask_text_field(from_number, "data_competencia", tx)
+            ask_text_field(from_number, "Data", tx)
             return {"ok": True}
-        tx["data_competencia"] = d
+        tx["Data"] = d
         pending["tx"] = tx
         pending["await"] = continue_wizard(from_number, tx)
         return {"ok": True}
@@ -789,3 +789,4 @@ async def receive(req: Request):
     pending["tx"] = tx
     pending["await"] = continue_wizard(from_number, tx)
     return {"ok": True}
+
