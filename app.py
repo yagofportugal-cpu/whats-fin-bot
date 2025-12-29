@@ -19,6 +19,13 @@ SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 # pendência por número: { from_number: {"tx": {...}, "stage": "collect"|"confirm", "await": "campo"} }
 PENDING = {}
 
+# Opções fixas para ORIGEM de receita (vai para coluna "categoria")
+ORIGENS_RECEITA = [
+    "Salário", "Férias", "13º", "Bônus", "Comissão", "PLR",
+    "Reembolso", "Rendimentos", "Freela", "Outros"
+]
+
+# Campos obrigatórios (categoria sempre obrigatória, mas a pergunta muda conforme tipo)
 REQUIRED_FIELDS = ["tipo", "valor", "categoria", "descricao", "pagamento", "data_competencia"]
 
 # ----------------------------
@@ -72,17 +79,12 @@ def append_row(values: list):
 def _now_iso():
     return dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
-def _today_iso_date():
-    return dt.date.today().isoformat()
-
 def parse_valor(text: str):
     t = text.lower()
     m = re.search(r"(\d{1,6}(?:[.,]\d{2})?)", t)
     if not m:
         return None
-    # 1.234,56 / 1234,56 / 35,90 / 35.90 (MVP)
     raw = m.group(1)
-    # remove separador de milhar simples
     raw = raw.replace(".", "").replace(",", ".")
     try:
         return float(raw)
@@ -93,7 +95,7 @@ def parse_tipo(text: str):
     t = text.lower()
     if any(k in t for k in ["receita", "recebi", "entrada", "salário", "salario", "ganhei", "caiu", "pix recebido"]):
         return "receita"
-    if any(k in t for k in ["gasto", "paguei", "comprei", "debitei", "gastei", "pago"]):
+    if any(k in t for k in ["gasto", "paguei", "comprei", "debitei", "gastei", "pago", "despesa"]):
         return "gasto"
     return None
 
@@ -109,7 +111,7 @@ def parse_pagamento(text: str):
         return "dinheiro"
     return None
 
-def parse_categoria(text: str):
+def parse_categoria_despesa(text: str):
     t = text.lower()
     if any(k in t for k in ["mercado", "supermerc", "padaria", "hortifruti"]):
         return "Mercado"
@@ -131,7 +133,6 @@ def parse_data_competencia(text: str):
     if "ontem" in t:
         return (dt.date.today() - dt.timedelta(days=1)).isoformat()
 
-    # dd/mm, dd-mm, dd/mm/yyyy, dd-mm-yy
     m = re.search(r"\b(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?\b", t)
     if not m:
         return None
@@ -177,6 +178,31 @@ def normalize_data(answer: str):
         return (dt.date.today() - dt.timedelta(days=1)).isoformat()
     return parse_data_competencia(a)
 
+def normalize_origem_receita(answer: str):
+    a = answer.strip().lower()
+
+    mapa = {
+        "salario": "Salário", "salário": "Salário",
+        "ferias": "Férias", "férias": "Férias",
+        "13": "13º", "13o": "13º", "13º": "13º", "decimo terceiro": "13º", "décimo terceiro": "13º",
+        "bonus": "Bônus", "bônus": "Bônus",
+        "comissao": "Comissão", "comissão": "Comissão",
+        "plr": "PLR",
+        "reembolso": "Reembolso",
+        "rendimentos": "Rendimentos",
+        "freela": "Freela",
+        "outro": "Outros", "outros": "Outros"
+    }
+    if a in mapa:
+        return mapa[a]
+
+    # aceita exatamente igual a lista (case-insensitive)
+    for opt in ORIGENS_RECEITA:
+        if a == opt.lower():
+            return opt
+
+    return None
+
 def missing_fields(tx: dict):
     missing = []
     for f in REQUIRED_FIELDS:
@@ -185,13 +211,19 @@ def missing_fields(tx: dict):
             missing.append(f)
     return missing
 
-def next_question(field: str):
+def next_question(field: str, tx: dict | None = None):
     if field == "tipo":
         return "Qual o **TIPO**? Responda: gasto ou receita."
     if field == "valor":
         return "Qual o **VALOR**? Ex: 35,90"
     if field == "categoria":
-        return "Qual a **CATEGORIA**? Ex: Mercado / Transporte / Moradia / etc."
+        if tx and tx.get("tipo") == "receita":
+            return (
+                "Qual a **ORIGEM** dessa receita?\n"
+                "Responda uma destas opções:\n"
+                "- Salário / Férias / 13º / Bônus / Comissão / PLR / Reembolso / Rendimentos / Freela / Outros"
+            )
+        return "Qual a **CATEGORIA** da despesa? Ex: Mercado / Transporte / Moradia / etc."
     if field == "descricao":
         return "Qual a **DESCRIÇÃO** (curta)? Ex: pão e leite"
     if field == "pagamento":
@@ -202,11 +234,12 @@ def next_question(field: str):
 
 def format_confirm(tx: dict):
     v = f"{tx['valor']:.2f}".replace(".", ",") if isinstance(tx.get("valor"), (int, float)) else "N/A"
+    label_cat = "origem" if tx.get("tipo") == "receita" else "categoria"
     return (
         "Confirma o lançamento?\n"
         f"- tipo: {tx.get('tipo')}\n"
         f"- valor: {v} {tx.get('moeda','BRL')}\n"
-        f"- categoria: {tx.get('categoria')}\n"
+        f"- {label_cat}: {tx.get('categoria')}\n"
         f"- descricao: {tx.get('descricao')}\n"
         f"- pagamento: {tx.get('pagamento')}\n"
         f"- data_competencia: {tx.get('data_competencia')}\n\n"
@@ -214,7 +247,7 @@ def format_confirm(tx: dict):
     )
 
 def tx_to_row(tx: dict):
-    # colunas: id, timestamp, tipo, valor, moeda, categoria, descricao, pagamento, data_competencia, confianca, confirmado, mensagem_original
+    # id, timestamp, tipo, valor, moeda, categoria, descricao, pagamento, data_competencia, confianca, confirmado, mensagem_original
     return [
         tx["id"],
         tx["timestamp"],
@@ -231,20 +264,23 @@ def tx_to_row(tx: dict):
     ]
 
 def init_tx(original_text: str):
-    # tenta inferir tudo, mas NÃO assume obrigatórios ausentes
     tipo = parse_tipo(original_text)
     valor = parse_valor(original_text)
-    categoria = parse_categoria(original_text)
     pagamento = parse_pagamento(original_text)
     data_comp = parse_data_competencia(original_text)
 
-    # descricao: se a mensagem for muito pobre (só número), força perguntar depois
+    categoria = None
+    if tipo == "gasto":
+        categoria = parse_categoria_despesa(original_text)
+    elif tipo == "receita":
+        # receita não tenta adivinhar origem; força pergunta se não vier
+        categoria = None
+
     cleaned = original_text.strip()
     descr = cleaned
     if re.fullmatch(r"\s*\d{1,6}(?:[.,]\d{2})?\s*", cleaned):
         descr = None
 
-    # confiança simples (MVP): quanto mais inferiu, maior
     inferred = sum(1 for x in [tipo, valor, categoria, pagamento, data_comp, descr] if x is not None)
     confianca = min(0.35 + inferred * 0.10, 0.95)
 
@@ -262,6 +298,16 @@ def init_tx(original_text: str):
         "confirmado": "não",
         "mensagem_original": original_text.strip(),
     }
+
+def normalize_valor_sign(tx: dict):
+    # gasto negativo, receita positivo
+    if tx.get("valor") is None:
+        return
+    v = float(tx["valor"])
+    if tx.get("tipo") == "gasto":
+        tx["valor"] = -abs(v)
+    elif tx.get("tipo") == "receita":
+        tx["valor"] = abs(v)
 
 # ----------------------------
 # Webhook Meta
@@ -301,7 +347,7 @@ async def receive(req: Request):
     if allowed and from_number != allowed:
         return {"ok": True}
 
-    # comandos globais
+    # comando global
     if t in ["cancelar", "cancela"]:
         PENDING.pop(from_number, None)
         send_whatsapp_text(from_number, "Cancelado.")
@@ -309,31 +355,32 @@ async def receive(req: Request):
 
     pending = PENDING.get(from_number)
 
-    # ---------
-    # Se está em confirmação
-    # ---------
+    # -------------------------
+    # estágio: confirmação
+    # -------------------------
     if pending and pending.get("stage") == "confirm":
         if t in ["sim", "confirmar", "ok"]:
             tx = pending["tx"]
             tx["confirmado"] = "sim"
-            PENDING.pop(from_number, None)
 
+            # aplica sinal do valor
+            normalize_valor_sign(tx)
+
+            PENDING.pop(from_number, None)
             append_row(tx_to_row(tx))
             send_whatsapp_text(from_number, "Gravado na planilha.")
             return {"ok": True}
 
-        # qualquer coisa diferente de SIM/CANCELAR
         send_whatsapp_text(from_number, "Responda: SIM para gravar ou CANCELAR para descartar.")
         return {"ok": True}
 
-    # ---------
-    # Se está coletando um campo faltante
-    # ---------
+    # -------------------------
+    # estágio: coletar faltantes
+    # -------------------------
     if pending and pending.get("stage") == "collect":
         field = pending.get("await")
         tx = pending["tx"]
 
-        # aplica resposta no campo esperado, com validação
         if field == "tipo":
             v = normalize_tipo(text)
             if not v:
@@ -349,8 +396,17 @@ async def receive(req: Request):
             tx["valor"] = v
 
         elif field == "categoria":
-            # aceita texto livre
-            tx["categoria"] = text.strip()
+            if tx.get("tipo") == "receita":
+                origem = normalize_origem_receita(text)
+                if not origem:
+                    send_whatsapp_text(
+                        from_number,
+                        "Origem inválida. Use: Salário, Férias, 13º, Bônus, Comissão, PLR, Reembolso, Rendimentos, Freela, Outros."
+                    )
+                    return {"ok": True}
+                tx["categoria"] = origem
+            else:
+                tx["categoria"] = text.strip()
 
         elif field == "descricao":
             tx["descricao"] = text.strip()
@@ -369,35 +425,39 @@ async def receive(req: Request):
                 return {"ok": True}
             tx["data_competencia"] = v
 
-        # verifica próximos faltantes
+        # se tipo virou gasto e categoria ainda vazia, tenta inferir categoria de despesa do texto original (opcional)
+        if tx.get("tipo") == "gasto" and not tx.get("categoria"):
+            inferred = parse_categoria_despesa(tx.get("mensagem_original", ""))
+            if inferred:
+                tx["categoria"] = inferred
+
         miss = missing_fields(tx)
         if miss:
             next_f = miss[0]
             pending["tx"] = tx
             pending["await"] = next_f
-            send_whatsapp_text(from_number, next_question(next_f))
+            send_whatsapp_text(from_number, next_question(next_f, tx))
             return {"ok": True}
 
-        # tudo preenchido -> pedir confirmação
+        # tudo completo -> confirmação
         pending["tx"] = tx
         pending["stage"] = "confirm"
         pending["await"] = None
         send_whatsapp_text(from_number, format_confirm(tx))
         return {"ok": True}
 
-    # ---------
-    # Novo lançamento
-    # ---------
+    # -------------------------
+    # novo lançamento
+    # -------------------------
     tx = init_tx(text)
-
     miss = missing_fields(tx)
+
     if miss:
-        # inicia coleta do primeiro faltante
         PENDING[from_number] = {"tx": tx, "stage": "collect", "await": miss[0]}
-        send_whatsapp_text(from_number, next_question(miss[0]))
+        send_whatsapp_text(from_number, next_question(miss[0], tx))
         return {"ok": True}
 
-    # se já veio completo, pede confirmação direto
+    # completo -> confirmação
     PENDING[from_number] = {"tx": tx, "stage": "confirm", "await": None}
     send_whatsapp_text(from_number, format_confirm(tx))
     return {"ok": True}
