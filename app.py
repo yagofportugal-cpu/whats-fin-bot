@@ -20,7 +20,7 @@ GRAPH_VER = "v22.0"
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 # ============================
-# TIMEZONE (FIX: Brasil)
+# TIMEZONE (Brasil)
 # ============================
 TZ = ZoneInfo(os.environ.get("APP_TIMEZONE", "America/Sao_Paulo"))
 
@@ -28,7 +28,7 @@ def now_local():
     return dt.datetime.now(TZ)
 
 def now_iso():
-    # timestamp em UTC para auditoria
+    # timestamp em UTC p/ auditoria
     return now_local().astimezone(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 def today_iso():
@@ -44,17 +44,7 @@ PENDING = {}  # {from: {"tx": {...}, "await": "...", "stage": "..."}}
 
 # Dedup inbound (evita retry duplicar lançamentos)
 SEEN_MSG = {}  # msg_id -> datetime_utc
-SEEN_TTL_SECONDS = 3600  # 1h
-
-ORIGENS_RECEITA = [
-    "Salário", "Férias", "13º", "Bônus", "Comissão", "PLR",
-    "Reembolso", "Rendimentos", "Freela", "Outros"
-]
-CATEGORIAS_DESPESA = [
-    "Mercado", "Transporte", "Moradia", "Alimentação", "Assinaturas",
-    "Saúde", "Lazer", "Educação", "Impostos", "Outros"
-]
-PAGAMENTOS_DESPESA = ["pix", "débito", "crédito", "dinheiro", "desconhecido"]
+SEEN_TTL_SECONDS = int(os.environ.get("SEEN_TTL_SECONDS", "3600"))  # 1h
 
 MSG_SALVO = "Show, já registrei aqui no nosso BD, quando tiver mais alguma movimentação me sinalize aqui!"
 TXT_INICIAL = "Olá, bora conferir saldos hoje ou você quer registrar algo?"
@@ -64,9 +54,9 @@ CANON_KEYS = [
     "pagamento", "data", "confianca", "confirmado", "mensagem_original"
 ]
 
-# ----------------------------
+# ============================
 # WhatsApp send
-# ----------------------------
+# ============================
 def wa_url():
     phone_number_id = os.environ["WA_PHONE_NUMBER_ID"]
     return f"https://graph.facebook.com/{GRAPH_VER}/{phone_number_id}/messages"
@@ -94,7 +84,7 @@ def send_whatsapp_text(to: str, text: str):
     })
 
 def send_whatsapp_buttons(to: str, body_text: str, buttons: list):
-    # Limite: 3 botões
+    # limite: 3 botões
     return _post_wa({
         "messaging_product": "whatsapp",
         "to": to,
@@ -112,7 +102,7 @@ def send_whatsapp_buttons(to: str, body_text: str, buttons: list):
     })
 
 def send_whatsapp_list(to: str, body_text: str, button_label: str, rows: list, section_title: str = "Opções"):
-    # Limite: 10 rows
+    # limite: 10 rows
     return _post_wa({
         "messaging_product": "whatsapp",
         "to": to,
@@ -134,9 +124,9 @@ def send_whatsapp_list(to: str, body_text: str, button_label: str, rows: list, s
         },
     })
 
-# ----------------------------
+# ============================
 # Google Sheets
-# ----------------------------
+# ============================
 def _sheets_service():
     creds_path = os.environ["GOOGLE_APPLICATION_CREDENTIALS"]
     creds = Credentials.from_service_account_file(creds_path, scopes=SCOPES)
@@ -160,9 +150,76 @@ def append_row(values: list):
         .execute()
     )
 
-# ----------------------------
-# Normalização de headers
-# ----------------------------
+# ============================
+# MENUS DINÂMICOS (aba Menus)
+# ============================
+MENU_SHEET_NAME = os.environ.get("GOOGLE_SHEETS_MENU_SHEET", "Menus")
+MENU_CACHE_TTL_SECONDS = int(os.environ.get("MENU_CACHE_TTL_SECONDS", "300"))  # 5 min
+_MENU_CACHE = {"ts": None, "data": None}
+
+def _read_column_values(range_a1: str) -> list[str]:
+    spreadsheet_id = os.environ["GOOGLE_SHEETS_SPREADSHEET_ID"]
+    svc = _sheets_service()
+    res = svc.spreadsheets().values().get(
+        spreadsheetId=spreadsheet_id,
+        range=range_a1,
+        valueRenderOption="FORMATTED_VALUE",
+    ).execute()
+    values = res.get("values") or []
+    out = []
+    for row in values:
+        if not row:
+            continue
+        v = str(row[0]).strip()
+        if v:
+            out.append(v)
+    return out
+
+def get_menus(force: bool = False) -> dict:
+    now = dt.datetime.utcnow()
+    ts = _MENU_CACHE.get("ts")
+    if not force and ts and (now - ts).total_seconds() < MENU_CACHE_TTL_SECONDS and _MENU_CACHE.get("data"):
+        return _MENU_CACHE["data"]
+
+    rng_origem = f"{MENU_SHEET_NAME}!A2:A"
+    rng_receb  = f"{MENU_SHEET_NAME}!B2:B"  # CORRETO: recebimento em B
+    rng_catdes = f"{MENU_SHEET_NAME}!D2:D"
+    rng_pagdes = f"{MENU_SHEET_NAME}!E2:E"
+
+    origens = _read_column_values(rng_origem)
+    receb   = _read_column_values(rng_receb)
+    cats    = _read_column_values(rng_catdes)
+    pays    = _read_column_values(rng_pagdes)
+
+    data = {
+        "origens_receita": origens,
+        "recebimentos_receita": receb,
+        "categorias_despesa": cats,
+        "pagamentos_despesa": pays,
+    }
+
+    _MENU_CACHE["ts"] = now
+    _MENU_CACHE["data"] = data
+    return data
+
+def _send_menu_in_chunks(to: str, body: str, button_label: str, items: list[str], id_prefix: str, section_title: str):
+    if not items:
+        send_whatsapp_text(to, "Não encontrei opções no menu. Preencha a aba *Menus* e tente novamente.")
+        return
+
+    chunk_size = 10
+    total_pages = (len(items) + chunk_size - 1) // chunk_size
+
+    for idx in range(0, len(items), chunk_size):
+        chunk = items[idx: idx + chunk_size]
+        rows = [{"id": f"{id_prefix}_{idx+i}", "title": v} for i, v in enumerate(chunk)]
+        page = idx // chunk_size + 1
+        suffix = "" if total_pages == 1 else f" ({page}/{total_pages})"
+        send_whatsapp_list(to, body + suffix, button_label, rows, section_title=section_title)
+
+# ============================
+# Normalização de headers (aba lançamentos)
+# ============================
 def _strip_accents(s: str) -> str:
     s = unicodedata.normalize("NFKD", s)
     return "".join(ch for ch in s if not unicodedata.combining(ch))
@@ -178,9 +235,6 @@ def normalize_header(h: str) -> str:
 
     mapping = {
         "descricao": "descricao",
-        "descri_o": "descricao",
-        "descrio": "descricao",
-        "descr": "descricao",
         "data": "data",
         "timestamp": "timestamp",
         "tipo": "tipo",
@@ -193,6 +247,7 @@ def normalize_header(h: str) -> str:
         "mensagem_original": "mensagem_original",
         "id": "id",
     }
+
     if s in mapping:
         return mapping[s]
     if s.startswith("mensagem"):
@@ -206,11 +261,6 @@ def normalize_header(h: str) -> str:
     return s
 
 def read_all_rows():
-    """
-    Lê a planilha e retorna lista de dicts com chaves CANON_KEYS.
-    - Normaliza headers
-    - valueRenderOption=UNFORMATTED_VALUE para capturar datas como serial number quando ocorrer
-    """
     spreadsheet_id = os.environ["GOOGLE_SHEETS_SPREADSHEET_ID"]
     rng = os.environ.get("GOOGLE_SHEETS_READ_RANGE") or os.environ.get("GOOGLE_SHEETS_RANGE", "lancamentos!A1")
 
@@ -246,9 +296,9 @@ def read_all_rows():
 
     return rows
 
-# ----------------------------
+# ============================
 # Helpers gerais
-# ----------------------------
+# ============================
 def parse_valor(text: str):
     t = (text or "").lower()
     m = re.search(r"(-?\d{1,9}(?:[.,]\d{2})?)", t)
@@ -352,9 +402,9 @@ def fmt_money_br(x: float):
 def iso_to_br(d: dt.date) -> str:
     return d.strftime("%d/%m/%Y")
 
-# ----------------------------
+# ============================
 # Wizard UI
-# ----------------------------
+# ============================
 def ask_inicio(to: str):
     send_whatsapp_buttons(
         to,
@@ -367,25 +417,51 @@ def ask_inicio(to: str):
     )
 
 def ask_categoria_ou_origem(to: str, tx: dict):
+    menus = get_menus()
+
     if tx.get("tipo") == "receita":
-        rows = [{"id": f"origem_{i}", "title": o} for i, o in enumerate(ORIGENS_RECEITA)]
-        send_whatsapp_list(to, "Qual a *ORIGEM* dessa receita?", "Escolher", rows, section_title="Origem")
+        origens = menus.get("origens_receita") or []
+        _send_menu_in_chunks(
+            to=to,
+            body="Qual a *ORIGEM* dessa receita?",
+            button_label="Escolher",
+            items=origens,
+            id_prefix="origem",
+            section_title="Origem",
+        )
     else:
-        rows = [{"id": f"cat_{i}", "title": c} for i, c in enumerate(CATEGORIAS_DESPESA)]
-        send_whatsapp_list(to, "Qual a *CATEGORIA* dessa despesa?", "Escolher", rows, section_title="Categoria")
+        cats = menus.get("categorias_despesa") or []
+        _send_menu_in_chunks(
+            to=to,
+            body="Qual a *CATEGORIA* dessa despesa?",
+            button_label="Escolher",
+            items=cats,
+            id_prefix="cat",
+            section_title="Categoria",
+        )
 
 def ask_pagamento_despesa(to: str):
-    rows = [{"id": f"pay_{i}", "title": p} for i, p in enumerate(PAGAMENTOS_DESPESA)]
-    send_whatsapp_list(to, "Como foi o pagamento?", "Escolher", rows, section_title="Pagamento")
+    menus = get_menus()
+    pays = menus.get("pagamentos_despesa") or []
+    _send_menu_in_chunks(
+        to=to,
+        body="Como foi o pagamento?",
+        button_label="Escolher",
+        items=pays,
+        id_prefix="pay",
+        section_title="Pagamento",
+    )
 
 def ask_recebimento_receita(to: str):
-    send_whatsapp_buttons(
-        to,
-        "Como foi o recebimento?",
-        [
-            {"id": "rec_dinheiro", "title": "Dinheiro"},
-            {"id": "rec_pix", "title": "PIX"},
-        ],
+    menus = get_menus()
+    recs = menus.get("recebimentos_receita") or []
+    _send_menu_in_chunks(
+        to=to,
+        body="Como foi o recebimento?",
+        button_label="Escolher",
+        items=recs,
+        id_prefix="rec",
+        section_title="Recebimento",
     )
 
 def ask_data(to: str):
@@ -453,6 +529,11 @@ def ask_text_field(to: str, field: str, tx: dict):
             send_whatsapp_text(to, "Digite a *ORIGEM* (texto). Ex: Salário, PLR, etc.")
         else:
             send_whatsapp_text(to, "Digite a *CATEGORIA* (texto). Ex: Pet, Viagem, etc.")
+    elif field == "pagamento":
+        if tx.get("tipo") == "receita":
+            send_whatsapp_text(to, "Digite a forma de *RECEBIMENTO* (texto). Ex: PIX, Dinheiro.")
+        else:
+            send_whatsapp_text(to, "Digite a forma de *PAGAMENTO* (texto). Ex: PIX, Débito.")
     else:
         send_whatsapp_text(to, "Preciso de uma informação (texto).")
 
@@ -482,9 +563,9 @@ def continue_wizard(to: str, tx: dict):
     ask_text_field(to, nxt, tx)
     return nxt
 
-# ----------------------------
-# Resumo: datas robustas + agregação
-# ----------------------------
+# ============================
+# Resumo
+# ============================
 def _to_float(v):
     if v is None or v == "":
         return 0.0
@@ -500,13 +581,6 @@ def _to_float(v):
         return 0.0
 
 def _parse_date_any(v):
-    """
-    Suporta:
-    - dt.date / dt.datetime
-    - ISO: YYYY-MM-DD
-    - BR: DD/MM[/YYYY]
-    - Serial number Google Sheets (dias desde 1899-12-30)
-    """
     if v is None or v == "":
         return None
 
@@ -644,9 +718,9 @@ def build_resumo_text(kind: str):
 
     return "\n".join(lines)
 
-# ----------------------------
+# ============================
 # Inbound parse + dedup cleanup
-# ----------------------------
+# ============================
 def extract_inbound(msg: dict):
     inter = msg.get("interactive") or {}
     if msg.get("type") == "interactive" or inter:
@@ -668,9 +742,9 @@ def cleanup_seen():
         if (now - t).total_seconds() > SEEN_TTL_SECONDS:
             SEEN_MSG.pop(k, None)
 
-# ----------------------------
+# ============================
 # Webhook
-# ----------------------------
+# ============================
 @app.get("/")
 def home():
     return {"status": "ok"}
@@ -696,7 +770,7 @@ async def receive(req: Request):
     changes = (entry.get("changes") or [{}])[0]
     value = changes.get("value") or {}
 
-    # ignora eventos de status
+    # ignora eventos de status (entrega, lido, etc)
     if value.get("statuses"):
         return {"ok": True}
 
@@ -726,6 +800,7 @@ async def receive(req: Request):
 
         kind, val, title = extract_inbound(msg)
 
+        # cancelar
         if kind == "text" and val.lower().strip() in ["cancelar", "cancela"]:
             PENDING.pop(from_number, None)
             send_whatsapp_text(from_number, "Cancelado. Mande qualquer mensagem para começar de novo.")
@@ -733,6 +808,7 @@ async def receive(req: Request):
 
         pending = PENDING.get(from_number)
 
+        # inicia menu
         if not pending:
             PENDING[from_number] = {"tx": None, "await": "inicio", "stage": "menu"}
             ask_inicio(from_number)
@@ -753,9 +829,9 @@ async def receive(req: Request):
                     "tipo": "receita",
                     "valor": None,
                     "moeda": "BRL",
-                    "categoria": None,
-                    "descricao": None,
-                    "pagamento": None,
+                    "categoria": None,  # origem
+                    "descricao": None,  # auto
+                    "pagamento": None,  # recebimento
                     "data": None,
                     "confianca": 0.60,
                     "confirmado": "não",
@@ -849,15 +925,16 @@ async def receive(req: Request):
             send_whatsapp_text(from_number, "Selecione SIM para gravar ou CANCELAR para descartar.")
             continue
 
-        # CATEGORIA
+        # CATEGORIA / ORIGEM
         if await_field == "categoria":
             if kind == "choice" and val:
                 if tx.get("tipo") == "receita" and val.startswith("origem_"):
-                    tx["categoria"] = title or "Outros"
+                    tx["categoria"] = title or ""
                 elif tx.get("tipo") == "despesa" and val.startswith("cat_"):
-                    tx["categoria"] = title or "Outros"
+                    tx["categoria"] = title or ""
 
-                if (tx.get("categoria") or "").strip().lower() == "outros":
+                # se veio vazio por algum motivo, pede texto
+                if not (tx.get("categoria") or "").strip():
                     pending["tx"] = tx
                     pending["await"] = "categoria_texto"
                     ask_text_field(from_number, "categoria", tx)
@@ -895,7 +972,7 @@ async def receive(req: Request):
             pending["await"] = continue_wizard(from_number, tx)
             continue
 
-        # DESCRIÇÃO
+        # DESCRIÇÃO (despesa)
         if await_field == "descricao":
             if kind != "text" or not val.strip():
                 ask_text_field(from_number, "descricao", tx)
@@ -905,10 +982,12 @@ async def receive(req: Request):
             pending["await"] = continue_wizard(from_number, tx)
             continue
 
-        # PAGAMENTO
+        # PAGAMENTO (despesa)
         if await_field == "pagamento":
             if kind == "choice" and val and val.startswith("pay_"):
-                tx["pagamento"] = (title or "desconhecido").lower().strip()
+                tx["pagamento"] = (title or "").strip().lower()
+                if not tx["pagamento"]:
+                    tx["pagamento"] = "desconhecido"
                 pending["tx"] = tx
                 pending["await"] = continue_wizard(from_number, tx)
                 continue
@@ -916,14 +995,16 @@ async def receive(req: Request):
             ask_pagamento_despesa(from_number)
             continue
 
-        # RECEBIMENTO
+        # RECEBIMENTO (receita)
         if await_field == "recebimento":
-            if kind == "choice" and val in ["rec_dinheiro", "rec_pix"]:
-                tx["pagamento"] = "dinheiro" if val == "rec_dinheiro" else "pix"
+            if kind == "choice" and val and val.startswith("rec_"):
+                tx["pagamento"] = (title or "").strip().lower()
+                if not tx["pagamento"]:
+                    tx["pagamento"] = "pix"
                 pending["tx"] = tx
                 pending["await"] = continue_wizard(from_number, tx)
                 continue
-            send_whatsapp_text(from_number, "Use os botões: Dinheiro ou PIX.")
+            send_whatsapp_text(from_number, "Escolha uma opção na lista de recebimento.")
             ask_recebimento_receita(from_number)
             continue
 
