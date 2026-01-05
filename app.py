@@ -42,13 +42,9 @@ def yesterday_iso():
 # ----------------------------
 PENDING = {}  # {from: {"tx": {...}, "await": "...", "stage": "..."}}
 
-# Dedup inbound (msg.id)
+# Dedup inbound (evita retry duplicar ações)
 SEEN_MSG = {}  # msg_id -> datetime_utc
 SEEN_TTL_SECONDS = int(os.environ.get("SEEN_TTL_SECONDS", "3600"))  # 1h
-
-# Dedup lógico por ação (resolve duplicação real)
-SEEN_ACTION = {}  # action_key -> datetime_utc
-SEEN_ACTION_TTL_SECONDS = int(os.environ.get("SEEN_ACTION_TTL_SECONDS", "6"))  # 6s
 
 MSG_SALVO = "Show, já registrei aqui no nosso BD, quando tiver mais alguma movimentação me sinalize aqui!"
 TXT_INICIAL = "Olá, bora conferir saldos hoje ou você quer registrar algo?"
@@ -190,16 +186,11 @@ def get_menus(force: bool = False) -> dict:
     rng_catdes = f"{MENU_SHEET_NAME}!D2:D"
     rng_pagdes = f"{MENU_SHEET_NAME}!E2:E"
 
-    origens = _read_column_values(rng_origem)
-    receb   = _read_column_values(rng_receb)
-    cats    = _read_column_values(rng_catdes)
-    pays    = _read_column_values(rng_pagdes)
-
     data = {
-        "origens_receita": origens,
-        "recebimentos_receita": receb,
-        "categorias_despesa": cats,
-        "pagamentos_despesa": pays,
+        "origens_receita": _read_column_values(rng_origem),
+        "recebimentos_receita": _read_column_values(rng_receb),
+        "categorias_despesa": _read_column_values(rng_catdes),
+        "pagamentos_despesa": _read_column_values(rng_pagdes),
     }
 
     _MENU_CACHE["ts"] = now
@@ -207,36 +198,61 @@ def get_menus(force: bool = False) -> dict:
     return data
 
 # ============================
-# Paginação real (1 página por vez)
+# Menus paginados (sem spam 1/2, 2/2)
 # ============================
-def send_menu_page(to: str, body: str, button_label: str, items: list[str], id_prefix: str, section_title: str, page: int = 1):
-    """
-    Envia 1 página de menu.
-    - WhatsApp list: máximo 10 rows.
-    - Usamos 9 itens + 1 row "Próxima" quando necessário.
-    """
+# lista do WhatsApp: 10 rows. Se tiver mais, reservamos 1 row pra "Mais..."
+MENU_PAGE_SIZE = 10
+MENU_PAGE_REAL = 9  # 9 itens + 1 "Mais..." quando precisar
+
+def _menu_next_id(menu_key: str, page: int) -> str:
+    return f"next|{menu_key}|{page}"
+
+def _is_menu_next(val: str) -> bool:
+    return isinstance(val, str) and val.startswith("next|")
+
+def _parse_menu_next(val: str):
+    # next|origem|1
+    try:
+        _, key, page = val.split("|", 2)
+        return key, int(page)
+    except:
+        return None, None
+
+def send_menu_page(
+    to: str,
+    body: str,
+    button_label: str,
+    items: list[str],
+    id_prefix: str,
+    section_title: str,
+    menu_key: str,
+    page: int = 0
+):
     if not items:
         send_whatsapp_text(to, "Não encontrei opções no menu. Preencha a aba *Menus* e tente novamente.")
         return
 
-    per_page = 9
-    total_pages = (len(items) + per_page - 1) // per_page
-    page = max(1, min(page, total_pages))
+    total_pages = (len(items) + MENU_PAGE_REAL - 1) // MENU_PAGE_REAL
+    total_pages = max(total_pages, 1)
+    page = max(page, 0)
 
-    start = (page - 1) * per_page
-    chunk = items[start:start + per_page]
+    start = page * MENU_PAGE_REAL
+    chunk = items[start:start + MENU_PAGE_REAL]
+    has_more = (start + MENU_PAGE_REAL) < len(items)
 
-    rows = [{"id": f"{id_prefix}_{start+i}", "title": v} for i, v in enumerate(chunk)]
+    rows = []
+    for i, v in enumerate(chunk):
+        global_index = start + i
+        rows.append({"id": f"{id_prefix}_{global_index}", "title": v})
 
-    # Próxima página
-    if total_pages > 1 and page < total_pages:
+    if has_more:
         rows.append({
-            "id": f"{id_prefix}__next__{page+1}",
-            "title": "➡️ Próxima página",
-            "description": f"Ver mais ({page+1}/{total_pages})"
+            "id": _menu_next_id(menu_key, page + 1),
+            "title": "Mais opções…",
+            "description": f"Ver mais ({page+2}/{total_pages})"
         })
 
-    suffix = "" if total_pages == 1 else f" ({page}/{total_pages})"
+    suffix = "" if total_pages == 1 else f" ({page+1}/{total_pages})"
     send_whatsapp_list(to, body + suffix, button_label, rows, section_title=section_title)
 
 # ============================
@@ -428,66 +444,68 @@ def iso_to_br(d: dt.date) -> str:
 # Wizard UI
 # ============================
 def ask_inicio(to: str):
-    send_whatsapp_buttons(
-        to,
-        TXT_INICIAL,
-        [
-            {"id": "inicio_receita", "title": "Receita"},
-            {"id": "inicio_despesa", "title": "Despesa"},
-            {"id": "inicio_resumo", "title": "Resumo"},
-        ],
-    )
+    # Aqui vira LISTA porque você quer 4 opções (botão só aceita 3)
+    rows = [
+        {"id": "inicio_receita", "title": "Receita", "description": "Registrar entrada"},
+        {"id": "inicio_despesa", "title": "Despesa", "description": "Registrar saída"},
+        {"id": "inicio_resumo", "title": "Resumo", "description": "Ver período (diário/semanal/...)"},
+        {"id": "inicio_analise", "title": "Análise", "description": "Pergunte algo sobre a planilha"},
+    ]
+    send_whatsapp_list(to, TXT_INICIAL, "Abrir", rows, section_title="Menu")
 
-def ask_categoria_ou_origem(to: str, tx: dict, page: int = 1):
+def ask_categoria_ou_origem(to: str, tx: dict, page: int = 0):
     menus = get_menus()
-
     if tx.get("tipo") == "receita":
-        origens = menus.get("origens_receita") or []
+        items = menus.get("origens_receita") or []
         send_menu_page(
             to=to,
             body="Qual a *ORIGEM* dessa receita?",
             button_label="Escolher",
-            items=origens,
+            items=items,
             id_prefix="origem",
             section_title="Origem",
-            page=page,
+            menu_key="origem",
+            page=page
         )
     else:
-        cats = menus.get("categorias_despesa") or []
+        items = menus.get("categorias_despesa") or []
         send_menu_page(
             to=to,
             body="Qual a *CATEGORIA* dessa despesa?",
             button_label="Escolher",
-            items=cats,
+            items=items,
             id_prefix="cat",
             section_title="Categoria",
-            page=page,
+            menu_key="cat",
+            page=page
         )
 
-def ask_pagamento_despesa(to: str, page: int = 1):
+def ask_pagamento_despesa(to: str, page: int = 0):
     menus = get_menus()
-    pays = menus.get("pagamentos_despesa") or []
+    items = menus.get("pagamentos_despesa") or []
     send_menu_page(
         to=to,
         body="Como foi o pagamento?",
         button_label="Escolher",
-        items=pays,
+        items=items,
         id_prefix="pay",
         section_title="Pagamento",
-        page=page,
+        menu_key="pay",
+        page=page
     )
 
-def ask_recebimento_receita(to: str, page: int = 1):
+def ask_recebimento_receita(to: str, page: int = 0):
     menus = get_menus()
-    recs = menus.get("recebimentos_receita") or []
+    items = menus.get("recebimentos_receita") or []
     send_menu_page(
         to=to,
         body="Como foi o recebimento?",
         button_label="Escolher",
-        items=recs,
+        items=items,
         id_prefix="rec",
         section_title="Recebimento",
-        page=page,
+        menu_key="rec",
+        page=page
     )
 
 def ask_data(to: str):
@@ -502,7 +520,7 @@ def ask_data(to: str):
     )
 
 def format_confirm(tx: dict):
-    v_abs = abs(float(tx["valor"])) if tx.get("valor") is not None and tx.get("valor") != "" else 0.0
+    v_abs = abs(float(tx["valor"])) if tx.get("valor") not in [None, ""] else 0.0
     sinal = "+" if tx.get("tipo") == "receita" else "-"
     label_cat = "origem" if tx.get("tipo") == "receita" else "categoria"
     label_pay = "recebimento" if tx.get("tipo") == "receita" else "pagamento"
@@ -572,14 +590,14 @@ def continue_wizard(to: str, tx: dict):
         return "confirm"
 
     if nxt == "categoria":
-        ask_categoria_ou_origem(to, tx, page=1)
+        ask_categoria_ou_origem(to, tx, page=0)
         return "categoria"
 
     if nxt == "pagamento":
         if tx.get("tipo") == "receita":
-            ask_recebimento_receita(to, page=1)
+            ask_recebimento_receita(to, page=0)
             return "recebimento"
-        ask_pagamento_despesa(to, page=1)
+        ask_pagamento_despesa(to, page=0)
         return "pagamento"
 
     if nxt == "data":
@@ -714,9 +732,7 @@ def build_resumo_text(kind: str):
     rec_top = sorted(rec_by_cat.items(), key=lambda x: x[1], reverse=True)[:12]
     des_top = sorted(des_by_cat.items(), key=lambda x: x[1], reverse=True)[:12]
 
-    perc = 0.0
-    if total_rec > 0:
-        perc = (total_des / total_rec) * 100.0
+    perc = (total_des / total_rec * 100.0) if total_rec > 0 else 0.0
 
     lines = []
     lines.append(f"*{label}*")
@@ -745,6 +761,132 @@ def build_resumo_text(kind: str):
     return "\n".join(lines)
 
 # ============================
+# ANÁLISE (OpenAI)
+# ============================
+def _extract_openai_text(resp_json: dict) -> str:
+    # Resposta da Responses API vem em "output" com content blocks.
+    # Vamos varrer e juntar qualquer texto.
+    out = []
+    for item in (resp_json.get("output") or []):
+        content = item.get("content") or []
+        for c in content:
+            t = c.get("text") or c.get("content") or ""
+            # alguns blocos usam {"type":"output_text","text":"..."}
+            if isinstance(t, str) and t.strip():
+                out.append(t.strip())
+            elif c.get("type") == "output_text" and isinstance(c.get("text"), str):
+                out.append(c["text"].strip())
+    # fallback: às vezes pode vir "output_text" em implementações
+    if not out and isinstance(resp_json.get("output_text"), str):
+        out = [resp_json["output_text"]]
+    return "\n".join(out).strip()
+
+def build_analysis_context(rows: list[dict]) -> str:
+    # Não mande planilha inteira pra API. Isso explode tokens e custo.
+    lookback_days = int(os.environ.get("OPENAI_LOOKBACK_DAYS", "365"))
+    max_rows = int(os.environ.get("OPENAI_MAX_ROWS", "250"))
+    cutoff = now_local().date() - dt.timedelta(days=lookback_days)
+
+    txs = []
+    for r in rows:
+        d = _parse_date_any(r.get("data"))
+        if not d or d < cutoff:
+            continue
+        tipo = (r.get("tipo") or "").strip().lower()
+        if tipo not in ["receita", "despesa"]:
+            continue
+        txs.append({
+            "data": d,
+            "tipo": tipo,
+            "valor": _to_float(r.get("valor")),
+            "categoria": (r.get("categoria") or "").strip(),
+            "descricao": (r.get("descricao") or "").strip(),
+            "pagamento": (r.get("pagamento") or "").strip(),
+        })
+
+    txs.sort(key=lambda x: x["data"], reverse=True)
+    txs = txs[:max_rows]
+
+    # resumo rápido (12m) por tipo e categoria
+    sum_rec = defaultdict(float)
+    sum_des = defaultdict(float)
+    total_rec = total_des = 0.0
+
+    for t in txs:
+        cat = t["categoria"] or "Sem categoria"
+        val = abs(float(t["valor"] or 0.0))
+        if t["tipo"] == "receita":
+            total_rec += val
+            sum_rec[cat] += val
+        else:
+            total_des += val
+            sum_des[cat] += val
+
+    rec_top = sorted(sum_rec.items(), key=lambda x: x[1], reverse=True)[:10]
+    des_top = sorted(sum_des.items(), key=lambda x: x[1], reverse=True)[:10]
+
+    lines = []
+    lines.append("DADOS (resumo):")
+    lines.append(f"- período considerado: últimos {lookback_days} dias")
+    lines.append(f"- transações enviadas: {len(txs)} (mais recentes)")
+    lines.append(f"- total receitas (nesse recorte): R$ {fmt_money_br(total_rec)}")
+    lines.append(f"- total despesas (nesse recorte): R$ {fmt_money_br(total_des)}")
+    lines.append("")
+    lines.append("TOP receitas por origem (recorte):")
+    for c, v in rec_top:
+        lines.append(f"- {c}: R$ {fmt_money_br(v)}")
+    lines.append("")
+    lines.append("TOP despesas por categoria (recorte):")
+    for c, v in des_top:
+        lines.append(f"- {c}: R$ {fmt_money_br(v)}")
+    lines.append("")
+    lines.append("TRANSACOES (CSV): data,tipo,valor,categoria,descricao,pagamento")
+    for t in txs:
+        lines.append(
+            f"{t['data'].isoformat()},{t['tipo']},{t['valor']},{t['categoria']},{t['descricao']},{t['pagamento']}"
+        )
+
+    return "\n".join(lines)
+
+def openai_analyze(question: str, rows: list[dict]) -> str:
+    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        return "Análise está desativada porque *OPENAI_API_KEY* não está configurada no Render."
+
+    model = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+
+    context = build_analysis_context(rows)
+
+    system_prompt = (
+        "Você é um assistente financeiro. Use SOMENTE os dados fornecidos no contexto.\n"
+        "Se a pergunta exigir dados fora do contexto, diga o que falta e sugira como perguntar.\n"
+        "Responda em pt-BR, objetivo, com números, e sem inventar lançamentos.\n"
+        "Se fizer suposição, declare explicitamente."
+    )
+
+    user_prompt = f"Pergunta do usuário:\n{question}\n\nContexto:\n{context}"
+
+    payload = {
+        "model": model,
+        "input": [
+            {"role": "system", "content": [{"type": "text", "text": system_prompt}]},
+            {"role": "user", "content": [{"type": "text", "text": user_prompt}]},
+        ],
+    }
+
+    r = requests.post(
+        "https://api.openai.com/v1/responses",
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        json=payload,
+        timeout=45,
+    )
+    if r.status_code >= 400:
+        return f"Falha na Análise (OpenAI): {r.status_code} - {r.text[:600]}"
+
+    txt = _extract_openai_text(r.json())
+    return txt[:3800] if txt else "Não consegui gerar a análise com os dados disponíveis."
+
+# ============================
 # Inbound parse + dedup cleanup
 # ============================
 def extract_inbound(msg: dict):
@@ -767,41 +909,6 @@ def cleanup_seen():
     for k, t in list(SEEN_MSG.items()):
         if (now - t).total_seconds() > SEEN_TTL_SECONDS:
             SEEN_MSG.pop(k, None)
-
-def cleanup_seen_action():
-    now = dt.datetime.utcnow()
-    for k, t in list(SEEN_ACTION.items()):
-        if (now - t).total_seconds() > SEEN_ACTION_TTL_SECONDS:
-            SEEN_ACTION.pop(k, None)
-
-def action_key(from_number: str, msg: dict) -> str:
-    """
-    Chave lógica por ação: resolve duplicação quando msg.id muda, mas ação é a mesma.
-    """
-    mtype = msg.get("type") or ""
-    if mtype == "interactive":
-        inter = msg.get("interactive") or {}
-        itype = inter.get("type") or ""
-        if itype == "button_reply":
-            rid = (inter.get("button_reply") or {}).get("id") or ""
-            return f"{from_number}|btn|{rid}"
-        if itype == "list_reply":
-            rid = (inter.get("list_reply") or {}).get("id") or ""
-            return f"{from_number}|list|{rid}"
-        return f"{from_number}|interactive|other"
-    if mtype == "text":
-        txt = ((msg.get("text") or {}).get("body") or "").strip().lower()
-        txt = re.sub(r"\s+", " ", txt)
-        return f"{from_number}|txt|{txt[:80]}"
-    return f"{from_number}|{mtype}|unknown"
-
-def already_handled_action(from_number: str, msg: dict) -> bool:
-    cleanup_seen_action()
-    k = action_key(from_number, msg)
-    if k in SEEN_ACTION:
-        return True
-    SEEN_ACTION[k] = dt.datetime.utcnow()
-    return False
 
 # ============================
 # Webhook
@@ -848,17 +955,12 @@ async def receive(req: Request):
         if allowed and from_number != allowed:
             continue
 
-        # dedup por msg.id
         cleanup_seen()
         msg_id = msg.get("id")
         if msg_id:
             if msg_id in SEEN_MSG:
                 continue
             SEEN_MSG[msg_id] = dt.datetime.utcnow()
-
-        # dedup lógico por ação (resolve repetição real)
-        if already_handled_action(from_number, msg):
-            continue
 
         msg_type = msg.get("type")
         if msg_type not in ["text", "interactive"]:
@@ -882,9 +984,9 @@ async def receive(req: Request):
 
         await_field = pending.get("await")
 
-        # =======================
+        # =====================================================
         # MENU INICIAL
-        # =======================
+        # =====================================================
         if await_field == "inicio":
             if kind != "choice":
                 ask_inicio(from_number)
@@ -934,12 +1036,39 @@ async def receive(req: Request):
                 ask_resumo_periodo(from_number)
                 continue
 
+            if val == "inicio_analise":
+                pending["tx"] = None
+                pending["await"] = "analise_pergunta"
+                send_whatsapp_text(
+                    from_number,
+                    "Manda sua pergunta de *Análise*.\n"
+                    "Exemplos:\n"
+                    "- 'Qual foi meu gasto total em Mercado este mês?'\n"
+                    "- 'Top 5 categorias de despesas nos últimos 3 meses'\n"
+                    "- 'Quanto gastei no cartão vs pix no mês?'"
+                )
+                continue
+
             ask_inicio(from_number)
             continue
 
-        # =======================
+        # =====================================================
+        # ANÁLISE
+        # =====================================================
+        if await_field == "analise_pergunta":
+            if kind != "text" or not val.strip():
+                send_whatsapp_text(from_number, "Escreve a pergunta em texto.")
+                continue
+
+            rows = read_all_rows()
+            answer = openai_analyze(val.strip(), rows)
+            send_whatsapp_text(from_number, answer)
+            PENDING.pop(from_number, None)
+            continue
+
+        # =====================================================
         # RESUMO
-        # =======================
+        # =====================================================
         if await_field == "resumo_periodo":
             if kind != "choice":
                 ask_resumo_periodo(from_number)
@@ -976,9 +1105,9 @@ async def receive(req: Request):
         # fluxo lançamento
         tx = pending.get("tx") or {}
 
-        # =======================
+        # =====================================================
         # CONFIRM
-        # =======================
+        # =====================================================
         if await_field == "confirm":
             if (kind == "choice" and val == "confirm_sim") or (kind == "text" and val.lower().strip() in ["sim", "ok", "confirmar"]):
                 tx["confirmado"] = "sim"
@@ -997,20 +1126,20 @@ async def receive(req: Request):
             send_whatsapp_text(from_number, "Selecione SIM para gravar ou CANCELAR para descartar.")
             continue
 
-        # =======================
-        # CATEGORIA / ORIGEM (com paginação)
-        # =======================
+        # =====================================================
+        # CATEGORIA / ORIGEM (paginado)
+        # =====================================================
         if await_field == "categoria":
             if kind == "choice" and val:
-                # Próxima página
-                if val.startswith("origem__next__"):
-                    page = int(val.split("__")[-1])
-                    ask_categoria_ou_origem(from_number, tx, page=page)
-                    continue
-                if val.startswith("cat__next__"):
-                    page = int(val.split("__")[-1])
-                    ask_categoria_ou_origem(from_number, tx, page=page)
-                    continue
+                # Paginação
+                if _is_menu_next(val):
+                    key, page = _parse_menu_next(val)
+                    if key == "origem":
+                        ask_categoria_ou_origem(from_number, tx, page=page)
+                        continue
+                    if key == "cat":
+                        ask_categoria_ou_origem(from_number, tx, page=page)
+                        continue
 
                 if tx.get("tipo") == "receita" and val.startswith("origem_"):
                     tx["categoria"] = title or ""
@@ -1028,7 +1157,7 @@ async def receive(req: Request):
                 continue
 
             send_whatsapp_text(from_number, "Escolha uma opção na lista.")
-            ask_categoria_ou_origem(from_number, tx, page=1)
+            ask_categoria_ou_origem(from_number, tx, page=0)
             continue
 
         if await_field == "categoria_texto":
@@ -1040,9 +1169,9 @@ async def receive(req: Request):
             pending["await"] = continue_wizard(from_number, tx)
             continue
 
-        # =======================
+        # =====================================================
         # VALOR
-        # =======================
+        # =====================================================
         if await_field == "valor":
             if kind != "text":
                 ask_text_field(from_number, "valor", tx)
@@ -1057,9 +1186,9 @@ async def receive(req: Request):
             pending["await"] = continue_wizard(from_number, tx)
             continue
 
-        # =======================
+        # =====================================================
         # DESCRIÇÃO (despesa)
-        # =======================
+        # =====================================================
         if await_field == "descricao":
             if kind != "text" or not val.strip():
                 ask_text_field(from_number, "descricao", tx)
@@ -1069,53 +1198,51 @@ async def receive(req: Request):
             pending["await"] = continue_wizard(from_number, tx)
             continue
 
-        # =======================
-        # PAGAMENTO (despesa) com paginação
-        # =======================
+        # =====================================================
+        # PAGAMENTO (despesa) paginado
+        # =====================================================
         if await_field == "pagamento":
             if kind == "choice" and val:
-                if val.startswith("pay__next__"):
-                    page = int(val.split("__")[-1])
-                    ask_pagamento_despesa(from_number, page=page)
-                    continue
+                if _is_menu_next(val):
+                    key, page = _parse_menu_next(val)
+                    if key == "pay":
+                        ask_pagamento_despesa(from_number, page=page)
+                        continue
 
                 if val.startswith("pay_"):
-                    tx["pagamento"] = (title or "").strip().lower()
-                    if not tx["pagamento"]:
-                        tx["pagamento"] = "desconhecido"
+                    tx["pagamento"] = (title or "").strip().lower() or "desconhecido"
                     pending["tx"] = tx
                     pending["await"] = continue_wizard(from_number, tx)
                     continue
 
             send_whatsapp_text(from_number, "Escolha uma opção na lista de pagamento.")
-            ask_pagamento_despesa(from_number, page=1)
+            ask_pagamento_despesa(from_number, page=0)
             continue
 
-        # =======================
-        # RECEBIMENTO (receita) com paginação
-        # =======================
+        # =====================================================
+        # RECEBIMENTO (receita) paginado
+        # =====================================================
         if await_field == "recebimento":
             if kind == "choice" and val:
-                if val.startswith("rec__next__"):
-                    page = int(val.split("__")[-1])
-                    ask_recebimento_receita(from_number, page=page)
-                    continue
+                if _is_menu_next(val):
+                    key, page = _parse_menu_next(val)
+                    if key == "rec":
+                        ask_recebimento_receita(from_number, page=page)
+                        continue
 
                 if val.startswith("rec_"):
-                    tx["pagamento"] = (title or "").strip().lower()
-                    if not tx["pagamento"]:
-                        tx["pagamento"] = "pix"
+                    tx["pagamento"] = (title or "").strip().lower() or "pix"
                     pending["tx"] = tx
                     pending["await"] = continue_wizard(from_number, tx)
                     continue
 
             send_whatsapp_text(from_number, "Escolha uma opção na lista de recebimento.")
-            ask_recebimento_receita(from_number, page=1)
+            ask_recebimento_receita(from_number, page=0)
             continue
 
-        # =======================
+        # =====================================================
         # DATA
-        # =======================
+        # =====================================================
         if await_field == "data":
             if kind == "choice" and val in ["data_hoje", "data_ontem", "data_outra"]:
                 if val == "data_hoje":
