@@ -42,9 +42,13 @@ def yesterday_iso():
 # ----------------------------
 PENDING = {}  # {from: {"tx": {...}, "await": "...", "stage": "..."}}
 
-# Dedup inbound (evita retry duplicar lançamentos)
+# Dedup inbound (msg.id)
 SEEN_MSG = {}  # msg_id -> datetime_utc
 SEEN_TTL_SECONDS = int(os.environ.get("SEEN_TTL_SECONDS", "3600"))  # 1h
+
+# Dedup lógico por ação (resolve duplicação real)
+SEEN_ACTION = {}  # action_key -> datetime_utc
+SEEN_ACTION_TTL_SECONDS = int(os.environ.get("SEEN_ACTION_TTL_SECONDS", "6"))  # 6s
 
 MSG_SALVO = "Show, já registrei aqui no nosso BD, quando tiver mais alguma movimentação me sinalize aqui!"
 TXT_INICIAL = "Olá, bora conferir saldos hoje ou você quer registrar algo?"
@@ -182,7 +186,7 @@ def get_menus(force: bool = False) -> dict:
         return _MENU_CACHE["data"]
 
     rng_origem = f"{MENU_SHEET_NAME}!A2:A"
-    rng_receb  = f"{MENU_SHEET_NAME}!B2:B"  # CORRETO: recebimento em B
+    rng_receb  = f"{MENU_SHEET_NAME}!B2:B"  # recebimento em B
     rng_catdes = f"{MENU_SHEET_NAME}!D2:D"
     rng_pagdes = f"{MENU_SHEET_NAME}!E2:E"
 
@@ -202,20 +206,38 @@ def get_menus(force: bool = False) -> dict:
     _MENU_CACHE["data"] = data
     return data
 
-def _send_menu_in_chunks(to: str, body: str, button_label: str, items: list[str], id_prefix: str, section_title: str):
+# ============================
+# Paginação real (1 página por vez)
+# ============================
+def send_menu_page(to: str, body: str, button_label: str, items: list[str], id_prefix: str, section_title: str, page: int = 1):
+    """
+    Envia 1 página de menu.
+    - WhatsApp list: máximo 10 rows.
+    - Usamos 9 itens + 1 row "Próxima" quando necessário.
+    """
     if not items:
         send_whatsapp_text(to, "Não encontrei opções no menu. Preencha a aba *Menus* e tente novamente.")
         return
 
-    chunk_size = 10
-    total_pages = (len(items) + chunk_size - 1) // chunk_size
+    per_page = 9
+    total_pages = (len(items) + per_page - 1) // per_page
+    page = max(1, min(page, total_pages))
 
-    for idx in range(0, len(items), chunk_size):
-        chunk = items[idx: idx + chunk_size]
-        rows = [{"id": f"{id_prefix}_{idx+i}", "title": v} for i, v in enumerate(chunk)]
-        page = idx // chunk_size + 1
-        suffix = "" if total_pages == 1 else f" ({page}/{total_pages})"
-        send_whatsapp_list(to, body + suffix, button_label, rows, section_title=section_title)
+    start = (page - 1) * per_page
+    chunk = items[start:start + per_page]
+
+    rows = [{"id": f"{id_prefix}_{start+i}", "title": v} for i, v in enumerate(chunk)]
+
+    # Próxima página
+    if total_pages > 1 and page < total_pages:
+        rows.append({
+            "id": f"{id_prefix}__next__{page+1}",
+            "title": "➡️ Próxima página",
+            "description": f"Ver mais ({page+1}/{total_pages})"
+        })
+
+    suffix = "" if total_pages == 1 else f" ({page}/{total_pages})"
+    send_whatsapp_list(to, body + suffix, button_label, rows, section_title=section_title)
 
 # ============================
 # Normalização de headers (aba lançamentos)
@@ -416,52 +438,56 @@ def ask_inicio(to: str):
         ],
     )
 
-def ask_categoria_ou_origem(to: str, tx: dict):
+def ask_categoria_ou_origem(to: str, tx: dict, page: int = 1):
     menus = get_menus()
 
     if tx.get("tipo") == "receita":
         origens = menus.get("origens_receita") or []
-        _send_menu_in_chunks(
+        send_menu_page(
             to=to,
             body="Qual a *ORIGEM* dessa receita?",
             button_label="Escolher",
             items=origens,
             id_prefix="origem",
             section_title="Origem",
+            page=page,
         )
     else:
         cats = menus.get("categorias_despesa") or []
-        _send_menu_in_chunks(
+        send_menu_page(
             to=to,
             body="Qual a *CATEGORIA* dessa despesa?",
             button_label="Escolher",
             items=cats,
             id_prefix="cat",
             section_title="Categoria",
+            page=page,
         )
 
-def ask_pagamento_despesa(to: str):
+def ask_pagamento_despesa(to: str, page: int = 1):
     menus = get_menus()
     pays = menus.get("pagamentos_despesa") or []
-    _send_menu_in_chunks(
+    send_menu_page(
         to=to,
         body="Como foi o pagamento?",
         button_label="Escolher",
         items=pays,
         id_prefix="pay",
         section_title="Pagamento",
+        page=page,
     )
 
-def ask_recebimento_receita(to: str):
+def ask_recebimento_receita(to: str, page: int = 1):
     menus = get_menus()
     recs = menus.get("recebimentos_receita") or []
-    _send_menu_in_chunks(
+    send_menu_page(
         to=to,
         body="Como foi o recebimento?",
         button_label="Escolher",
         items=recs,
         id_prefix="rec",
         section_title="Recebimento",
+        page=page,
     )
 
 def ask_data(to: str):
@@ -546,14 +572,14 @@ def continue_wizard(to: str, tx: dict):
         return "confirm"
 
     if nxt == "categoria":
-        ask_categoria_ou_origem(to, tx)
+        ask_categoria_ou_origem(to, tx, page=1)
         return "categoria"
 
     if nxt == "pagamento":
         if tx.get("tipo") == "receita":
-            ask_recebimento_receita(to)
+            ask_recebimento_receita(to, page=1)
             return "recebimento"
-        ask_pagamento_despesa(to)
+        ask_pagamento_despesa(to, page=1)
         return "pagamento"
 
     if nxt == "data":
@@ -742,6 +768,41 @@ def cleanup_seen():
         if (now - t).total_seconds() > SEEN_TTL_SECONDS:
             SEEN_MSG.pop(k, None)
 
+def cleanup_seen_action():
+    now = dt.datetime.utcnow()
+    for k, t in list(SEEN_ACTION.items()):
+        if (now - t).total_seconds() > SEEN_ACTION_TTL_SECONDS:
+            SEEN_ACTION.pop(k, None)
+
+def action_key(from_number: str, msg: dict) -> str:
+    """
+    Chave lógica por ação: resolve duplicação quando msg.id muda, mas ação é a mesma.
+    """
+    mtype = msg.get("type") or ""
+    if mtype == "interactive":
+        inter = msg.get("interactive") or {}
+        itype = inter.get("type") or ""
+        if itype == "button_reply":
+            rid = (inter.get("button_reply") or {}).get("id") or ""
+            return f"{from_number}|btn|{rid}"
+        if itype == "list_reply":
+            rid = (inter.get("list_reply") or {}).get("id") or ""
+            return f"{from_number}|list|{rid}"
+        return f"{from_number}|interactive|other"
+    if mtype == "text":
+        txt = ((msg.get("text") or {}).get("body") or "").strip().lower()
+        txt = re.sub(r"\s+", " ", txt)
+        return f"{from_number}|txt|{txt[:80]}"
+    return f"{from_number}|{mtype}|unknown"
+
+def already_handled_action(from_number: str, msg: dict) -> bool:
+    cleanup_seen_action()
+    k = action_key(from_number, msg)
+    if k in SEEN_ACTION:
+        return True
+    SEEN_ACTION[k] = dt.datetime.utcnow()
+    return False
+
 # ============================
 # Webhook
 # ============================
@@ -787,12 +848,17 @@ async def receive(req: Request):
         if allowed and from_number != allowed:
             continue
 
+        # dedup por msg.id
         cleanup_seen()
         msg_id = msg.get("id")
         if msg_id:
             if msg_id in SEEN_MSG:
                 continue
             SEEN_MSG[msg_id] = dt.datetime.utcnow()
+
+        # dedup lógico por ação (resolve repetição real)
+        if already_handled_action(from_number, msg):
+            continue
 
         msg_type = msg.get("type")
         if msg_type not in ["text", "interactive"]:
@@ -816,7 +882,9 @@ async def receive(req: Request):
 
         await_field = pending.get("await")
 
+        # =======================
         # MENU INICIAL
+        # =======================
         if await_field == "inicio":
             if kind != "choice":
                 ask_inicio(from_number)
@@ -869,7 +937,9 @@ async def receive(req: Request):
             ask_inicio(from_number)
             continue
 
+        # =======================
         # RESUMO
+        # =======================
         if await_field == "resumo_periodo":
             if kind != "choice":
                 ask_resumo_periodo(from_number)
@@ -906,7 +976,9 @@ async def receive(req: Request):
         # fluxo lançamento
         tx = pending.get("tx") or {}
 
+        # =======================
         # CONFIRM
+        # =======================
         if await_field == "confirm":
             if (kind == "choice" and val == "confirm_sim") or (kind == "text" and val.lower().strip() in ["sim", "ok", "confirmar"]):
                 tx["confirmado"] = "sim"
@@ -925,15 +997,26 @@ async def receive(req: Request):
             send_whatsapp_text(from_number, "Selecione SIM para gravar ou CANCELAR para descartar.")
             continue
 
-        # CATEGORIA / ORIGEM
+        # =======================
+        # CATEGORIA / ORIGEM (com paginação)
+        # =======================
         if await_field == "categoria":
             if kind == "choice" and val:
+                # Próxima página
+                if val.startswith("origem__next__"):
+                    page = int(val.split("__")[-1])
+                    ask_categoria_ou_origem(from_number, tx, page=page)
+                    continue
+                if val.startswith("cat__next__"):
+                    page = int(val.split("__")[-1])
+                    ask_categoria_ou_origem(from_number, tx, page=page)
+                    continue
+
                 if tx.get("tipo") == "receita" and val.startswith("origem_"):
                     tx["categoria"] = title or ""
                 elif tx.get("tipo") == "despesa" and val.startswith("cat_"):
                     tx["categoria"] = title or ""
 
-                # se veio vazio por algum motivo, pede texto
                 if not (tx.get("categoria") or "").strip():
                     pending["tx"] = tx
                     pending["await"] = "categoria_texto"
@@ -945,7 +1028,7 @@ async def receive(req: Request):
                 continue
 
             send_whatsapp_text(from_number, "Escolha uma opção na lista.")
-            ask_categoria_ou_origem(from_number, tx)
+            ask_categoria_ou_origem(from_number, tx, page=1)
             continue
 
         if await_field == "categoria_texto":
@@ -957,7 +1040,9 @@ async def receive(req: Request):
             pending["await"] = continue_wizard(from_number, tx)
             continue
 
+        # =======================
         # VALOR
+        # =======================
         if await_field == "valor":
             if kind != "text":
                 ask_text_field(from_number, "valor", tx)
@@ -972,7 +1057,9 @@ async def receive(req: Request):
             pending["await"] = continue_wizard(from_number, tx)
             continue
 
+        # =======================
         # DESCRIÇÃO (despesa)
+        # =======================
         if await_field == "descricao":
             if kind != "text" or not val.strip():
                 ask_text_field(from_number, "descricao", tx)
@@ -982,33 +1069,53 @@ async def receive(req: Request):
             pending["await"] = continue_wizard(from_number, tx)
             continue
 
-        # PAGAMENTO (despesa)
+        # =======================
+        # PAGAMENTO (despesa) com paginação
+        # =======================
         if await_field == "pagamento":
-            if kind == "choice" and val and val.startswith("pay_"):
-                tx["pagamento"] = (title or "").strip().lower()
-                if not tx["pagamento"]:
-                    tx["pagamento"] = "desconhecido"
-                pending["tx"] = tx
-                pending["await"] = continue_wizard(from_number, tx)
-                continue
+            if kind == "choice" and val:
+                if val.startswith("pay__next__"):
+                    page = int(val.split("__")[-1])
+                    ask_pagamento_despesa(from_number, page=page)
+                    continue
+
+                if val.startswith("pay_"):
+                    tx["pagamento"] = (title or "").strip().lower()
+                    if not tx["pagamento"]:
+                        tx["pagamento"] = "desconhecido"
+                    pending["tx"] = tx
+                    pending["await"] = continue_wizard(from_number, tx)
+                    continue
+
             send_whatsapp_text(from_number, "Escolha uma opção na lista de pagamento.")
-            ask_pagamento_despesa(from_number)
+            ask_pagamento_despesa(from_number, page=1)
             continue
 
-        # RECEBIMENTO (receita)
+        # =======================
+        # RECEBIMENTO (receita) com paginação
+        # =======================
         if await_field == "recebimento":
-            if kind == "choice" and val and val.startswith("rec_"):
-                tx["pagamento"] = (title or "").strip().lower()
-                if not tx["pagamento"]:
-                    tx["pagamento"] = "pix"
-                pending["tx"] = tx
-                pending["await"] = continue_wizard(from_number, tx)
-                continue
+            if kind == "choice" and val:
+                if val.startswith("rec__next__"):
+                    page = int(val.split("__")[-1])
+                    ask_recebimento_receita(from_number, page=page)
+                    continue
+
+                if val.startswith("rec_"):
+                    tx["pagamento"] = (title or "").strip().lower()
+                    if not tx["pagamento"]:
+                        tx["pagamento"] = "pix"
+                    pending["tx"] = tx
+                    pending["await"] = continue_wizard(from_number, tx)
+                    continue
+
             send_whatsapp_text(from_number, "Escolha uma opção na lista de recebimento.")
-            ask_recebimento_receita(from_number)
+            ask_recebimento_receita(from_number, page=1)
             continue
 
+        # =======================
         # DATA
+        # =======================
         if await_field == "data":
             if kind == "choice" and val in ["data_hoje", "data_ontem", "data_outra"]:
                 if val == "data_hoje":
