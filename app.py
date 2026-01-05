@@ -5,6 +5,7 @@ import unicodedata
 import datetime as dt
 import requests
 from collections import defaultdict
+from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, Request, Response
 from dotenv import load_dotenv
@@ -17,6 +18,24 @@ app = FastAPI()
 
 GRAPH_VER = "v22.0"
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+
+# ============================
+# TIMEZONE (FIX: Brasil)
+# ============================
+TZ = ZoneInfo(os.environ.get("APP_TIMEZONE", "America/Sao_Paulo"))
+
+def now_local():
+    return dt.datetime.now(TZ)
+
+def now_iso():
+    # timestamp em UTC para auditoria
+    return now_local().astimezone(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+def today_iso():
+    return now_local().date().isoformat()
+
+def yesterday_iso():
+    return (now_local().date() - dt.timedelta(days=1)).isoformat()
 
 # ----------------------------
 # Estado (memória)
@@ -143,7 +162,6 @@ def append_row(values: list):
 
 # ----------------------------
 # Normalização de headers
-# Holland: remove acentos, lowercase, limpa símbolos
 # ----------------------------
 def _strip_accents(s: str) -> str:
     s = unicodedata.normalize("NFKD", s)
@@ -154,17 +172,10 @@ def normalize_header(h: str) -> str:
         return ""
     s = str(h).strip()
     s = _strip_accents(s).lower()
-
-    # remove conteúdo entre parênteses (ex: pagamento (pix/..))
     s = re.sub(r"\(.*?\)", "", s).strip()
-
-    # troca separadores por underscore
     s = re.sub(r"[\s\-\/]+", "_", s)
-
-    # remove caracteres estranhos
     s = re.sub(r"[^a-z0-9_]", "", s)
 
-    # normaliza nomes conhecidos (pt-br)
     mapping = {
         "descricao": "descricao",
         "descri_o": "descricao",
@@ -182,7 +193,6 @@ def normalize_header(h: str) -> str:
         "mensagem_original": "mensagem_original",
         "id": "id",
     }
-    # tenta casar por prefixo também
     if s in mapping:
         return mapping[s]
     if s.startswith("mensagem"):
@@ -199,7 +209,7 @@ def read_all_rows():
     """
     Lê a planilha e retorna lista de dicts com chaves CANON_KEYS.
     - Normaliza headers
-    - Usa valueRenderOption=UNFORMATTED_VALUE para capturar datas como serial number quando ocorrer
+    - valueRenderOption=UNFORMATTED_VALUE para capturar datas como serial number quando ocorrer
     """
     spreadsheet_id = os.environ["GOOGLE_SHEETS_SPREADSHEET_ID"]
     rng = os.environ.get("GOOGLE_SHEETS_READ_RANGE") or os.environ.get("GOOGLE_SHEETS_RANGE", "lancamentos!A1")
@@ -224,7 +234,6 @@ def read_all_rows():
     raw_headers = values[0]
     headers = [normalize_header(h) for h in raw_headers]
 
-    # garante que pelo menos reconhece "data" / "valor" / "tipo"
     rows = []
     for line in values[1:]:
         row = {}
@@ -232,7 +241,6 @@ def read_all_rows():
             if not h:
                 continue
             row[h] = line[i] if i < len(line) else ""
-        # completa chaves canônicas ausentes
         canon = {k: row.get(k, "") for k in CANON_KEYS}
         rows.append(canon)
 
@@ -241,15 +249,8 @@ def read_all_rows():
 # ----------------------------
 # Helpers gerais
 # ----------------------------
-def now_iso():
-    return dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
-
-def today_iso():
-    return dt.date.today().isoformat()
-
 def parse_valor(text: str):
     t = (text or "").lower()
-    # aceita "35,90" ou "35.90" ou "3500" e também "-35,90"
     m = re.search(r"(-?\d{1,9}(?:[.,]\d{2})?)", t)
     if not m:
         return None
@@ -262,9 +263,9 @@ def parse_valor(text: str):
 def parse_data_text(text: str):
     t = (text or "").lower().strip()
     if t == "hoje":
-        return dt.date.today().isoformat()
+        return today_iso()
     if t == "ontem":
-        return (dt.date.today() - dt.timedelta(days=1)).isoformat()
+        return yesterday_iso()
 
     m = re.search(r"\b(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?\b", t)
     if not m:
@@ -274,7 +275,7 @@ def parse_data_text(text: str):
     mo = int(m.group(2))
     y = m.group(3)
     if y is None:
-        y = dt.date.today().year
+        y = now_local().date().year
     else:
         y = int(y)
         if y < 100:
@@ -312,7 +313,6 @@ def ensure_receita_descricao(tx: dict):
         tx["descricao"] = "Receita"
 
 def tx_to_row(tx: dict):
-    # ordem precisa bater com header da planilha (A..L)
     return [
         tx.get("id", ""),
         tx.get("timestamp", ""),
@@ -331,7 +331,7 @@ def tx_to_row(tx: dict):
 def required_fields(tx: dict):
     base = ["tipo", "valor", "categoria", "pagamento", "data"]
     if tx.get("tipo") == "despesa":
-        base.insert(3, "descricao")  # descrição obrigatória só para despesa
+        base.insert(3, "descricao")
     return base
 
 def next_missing(tx: dict):
@@ -425,7 +425,6 @@ def ask_confirm(to: str, tx: dict):
     )
 
 def ask_resumo_periodo(to: str):
-    # botões (3) + lista "Outros" com 3m/6m/12m
     send_whatsapp_buttons(
         to,
         "Qual resumo você quer ver?",
@@ -489,7 +488,6 @@ def continue_wizard(to: str, tx: dict):
 def _to_float(v):
     if v is None or v == "":
         return 0.0
-    # se vier numérico do Sheets
     if isinstance(v, (int, float)):
         return float(v)
     s = str(v).strip()
@@ -517,7 +515,6 @@ def _parse_date_any(v):
     if isinstance(v, dt.date):
         return v
 
-    # serial number (Sheets)
     if isinstance(v, (int, float)):
         try:
             base = dt.date(1899, 12, 30)
@@ -527,7 +524,6 @@ def _parse_date_any(v):
 
     s = str(v).strip()
 
-    # numeric string serial
     if re.fullmatch(r"\d+(\.\d+)?", s):
         try:
             base = dt.date(1899, 12, 30)
@@ -535,20 +531,18 @@ def _parse_date_any(v):
         except:
             pass
 
-    # ISO
     try:
         return dt.date.fromisoformat(s[:10])
     except:
         pass
 
-    # BR dd/mm[/yyyy]
     m = re.search(r"\b(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?\b", s)
     if m:
         d = int(m.group(1))
         mo = int(m.group(2))
         yy = m.group(3)
         if yy is None:
-            y = dt.date.today().year
+            y = now_local().date().year
         else:
             y = int(yy)
             if y < 100:
@@ -561,7 +555,7 @@ def _parse_date_any(v):
     return None
 
 def get_period_range(kind: str):
-    today = dt.date.today()
+    today = now_local().date()
     if kind == "diario":
         start = today
     elif kind == "semanal":
@@ -601,7 +595,6 @@ def build_resumo_text(kind: str):
         cat = (r.get("categoria") or "Sem categoria").strip() or "Sem categoria"
         val = _to_float(r.get("valor"))
 
-        # no seu modelo: receita positiva, despesa negativa
         if tipo == "receita":
             total_rec += abs(val)
             rec_by_cat[cat] += abs(val)
@@ -652,10 +645,9 @@ def build_resumo_text(kind: str):
     return "\n".join(lines)
 
 # ----------------------------
-# Inbound parse
+# Inbound parse + dedup cleanup
 # ----------------------------
 def extract_inbound(msg: dict):
-    # interactive
     inter = msg.get("interactive") or {}
     if msg.get("type") == "interactive" or inter:
         itype = inter.get("type")
@@ -667,7 +659,6 @@ def extract_inbound(msg: dict):
             return ("choice", rep.get("id"), rep.get("title"))
         return ("text", "", "")
 
-    # text
     text = (msg.get("text") or {}).get("body", "")
     return ("text", (text or "").strip(), "")
 
@@ -705,7 +696,7 @@ async def receive(req: Request):
     changes = (entry.get("changes") or [{}])[0]
     value = changes.get("value") or {}
 
-    # 1) ignore statuses (delivered/read/failed)
+    # ignora eventos de status
     if value.get("statuses"):
         return {"ok": True}
 
@@ -713,18 +704,15 @@ async def receive(req: Request):
     if not messages:
         return {"ok": True}
 
-    # processa todas as mensagens no payload (mais seguro)
     for msg in messages:
         from_number = msg.get("from")
         if not from_number:
             continue
 
-        # 2) ALLOWED_WA_NUMBER (se setado)
         allowed = os.environ.get("ALLOWED_WA_NUMBER", "").strip()
         if allowed and from_number != allowed:
             continue
 
-        # 3) Dedup por message id (retry)
         cleanup_seen()
         msg_id = msg.get("id")
         if msg_id:
@@ -738,7 +726,6 @@ async def receive(req: Request):
 
         kind, val, title = extract_inbound(msg)
 
-        # cancelar por texto
         if kind == "text" and val.lower().strip() in ["cancelar", "cancela"]:
             PENDING.pop(from_number, None)
             send_whatsapp_text(from_number, "Cancelado. Mande qualquer mensagem para começar de novo.")
@@ -746,7 +733,6 @@ async def receive(req: Request):
 
         pending = PENDING.get(from_number)
 
-        # Se NÃO há wizard ativo: inicia menu inicial
         if not pending:
             PENDING[from_number] = {"tx": None, "await": "inicio", "stage": "menu"}
             ask_inicio(from_number)
@@ -754,9 +740,7 @@ async def receive(req: Request):
 
         await_field = pending.get("await")
 
-        # -------------------------
         # MENU INICIAL
-        # -------------------------
         if await_field == "inicio":
             if kind != "choice":
                 ask_inicio(from_number)
@@ -769,9 +753,9 @@ async def receive(req: Request):
                     "tipo": "receita",
                     "valor": None,
                     "moeda": "BRL",
-                    "categoria": None,     # origem
-                    "descricao": None,     # auto
-                    "pagamento": None,     # recebimento (pix/dinheiro)
+                    "categoria": None,
+                    "descricao": None,
+                    "pagamento": None,
                     "data": None,
                     "confianca": 0.60,
                     "confirmado": "não",
@@ -809,9 +793,7 @@ async def receive(req: Request):
             ask_inicio(from_number)
             continue
 
-        # -------------------------
-        # RESUMO: escolher período
-        # -------------------------
+        # RESUMO
         if await_field == "resumo_periodo":
             if kind != "choice":
                 ask_resumo_periodo(from_number)
@@ -821,27 +803,22 @@ async def receive(req: Request):
                 send_whatsapp_text(from_number, build_resumo_text("diario"))
                 PENDING.pop(from_number, None)
                 continue
-
             if val == "res_semanal":
                 send_whatsapp_text(from_number, build_resumo_text("semanal"))
                 PENDING.pop(from_number, None)
                 continue
-
             if val == "res_mensal":
                 send_whatsapp_text(from_number, build_resumo_text("mensal"))
                 PENDING.pop(from_number, None)
                 continue
-
             if val == "res_3m":
                 send_whatsapp_text(from_number, build_resumo_text("3m"))
                 PENDING.pop(from_number, None)
                 continue
-
             if val == "res_6m":
                 send_whatsapp_text(from_number, build_resumo_text("6m"))
                 PENDING.pop(from_number, None)
                 continue
-
             if val == "res_12m":
                 send_whatsapp_text(from_number, build_resumo_text("12m"))
                 PENDING.pop(from_number, None)
@@ -850,12 +827,10 @@ async def receive(req: Request):
             ask_resumo_periodo(from_number)
             continue
 
-        # daqui pra frente: fluxo de lançamento (wizard)
+        # fluxo lançamento
         tx = pending.get("tx") or {}
 
-        # -------------------------
-        # CONFIRMAÇÃO
-        # -------------------------
+        # CONFIRM
         if await_field == "confirm":
             if (kind == "choice" and val == "confirm_sim") or (kind == "text" and val.lower().strip() in ["sim", "ok", "confirmar"]):
                 tx["confirmado"] = "sim"
@@ -874,9 +849,7 @@ async def receive(req: Request):
             send_whatsapp_text(from_number, "Selecione SIM para gravar ou CANCELAR para descartar.")
             continue
 
-        # -------------------------
-        # CATEGORIA / ORIGEM
-        # -------------------------
+        # CATEGORIA
         if await_field == "categoria":
             if kind == "choice" and val:
                 if tx.get("tipo") == "receita" and val.startswith("origem_"):
@@ -907,9 +880,7 @@ async def receive(req: Request):
             pending["await"] = continue_wizard(from_number, tx)
             continue
 
-        # -------------------------
-        # VALOR (texto)
-        # -------------------------
+        # VALOR
         if await_field == "valor":
             if kind != "text":
                 ask_text_field(from_number, "valor", tx)
@@ -924,9 +895,7 @@ async def receive(req: Request):
             pending["await"] = continue_wizard(from_number, tx)
             continue
 
-        # -------------------------
-        # DESCRIÇÃO (apenas despesa)
-        # -------------------------
+        # DESCRIÇÃO
         if await_field == "descricao":
             if kind != "text" or not val.strip():
                 ask_text_field(from_number, "descricao", tx)
@@ -936,9 +905,7 @@ async def receive(req: Request):
             pending["await"] = continue_wizard(from_number, tx)
             continue
 
-        # -------------------------
-        # PAGAMENTO (despesa)
-        # -------------------------
+        # PAGAMENTO
         if await_field == "pagamento":
             if kind == "choice" and val and val.startswith("pay_"):
                 tx["pagamento"] = (title or "desconhecido").lower().strip()
@@ -949,9 +916,7 @@ async def receive(req: Request):
             ask_pagamento_despesa(from_number)
             continue
 
-        # -------------------------
-        # RECEBIMENTO (receita)
-        # -------------------------
+        # RECEBIMENTO
         if await_field == "recebimento":
             if kind == "choice" and val in ["rec_dinheiro", "rec_pix"]:
                 tx["pagamento"] = "dinheiro" if val == "rec_dinheiro" else "pix"
@@ -962,9 +927,7 @@ async def receive(req: Request):
             ask_recebimento_receita(from_number)
             continue
 
-        # -------------------------
         # DATA
-        # -------------------------
         if await_field == "data":
             if kind == "choice" and val in ["data_hoje", "data_ontem", "data_outra"]:
                 if val == "data_hoje":
@@ -973,7 +936,7 @@ async def receive(req: Request):
                     pending["await"] = continue_wizard(from_number, tx)
                     continue
                 if val == "data_ontem":
-                    tx["data"] = (dt.date.today() - dt.timedelta(days=1)).isoformat()
+                    tx["data"] = yesterday_iso()
                     pending["tx"] = tx
                     pending["await"] = continue_wizard(from_number, tx)
                     continue
@@ -1000,7 +963,7 @@ async def receive(req: Request):
             pending["await"] = continue_wizard(from_number, tx)
             continue
 
-        # fallback: tenta continuar o wizard
+        # fallback
         pending["tx"] = tx
         pending["await"] = continue_wizard(from_number, tx)
 
