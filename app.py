@@ -31,7 +31,6 @@ def now_local():
     return dt.datetime.now(TZ)
 
 def now_iso_utc():
-    # timestamp em UTC para auditoria
     return now_local().astimezone(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 def today_iso_local():
@@ -47,14 +46,15 @@ PENDING = {}      # {from: {"tx": {...} or None, "await": "...", "stage": "...",
 SEEN_MSG = {}     # {msg_id: datetime_utc}
 SEEN_TTL_SECONDS = int(os.environ.get("SEEN_TTL_SECONDS", "3600"))  # 1h
 
-# paging para listas (evitar mandar 2 telas seguidas)
-MENU_PAGING = {}  # {from: {"items": [...], "offset": int, "id_prefix": str, "field": str}}
+# paging para listas (1 lista por vez; "Mais opções" pagina)
+MENU_PAGING = {}  # {from: {"items":[...], "offset": int, "id_prefix": str, "field": str, ...}}
 
 # ============================================================
 # TEXTS
 # ============================================================
 MSG_SALVO = "Show, já registrei aqui no nosso BD, quando tiver mais alguma movimentação me sinalize aqui!"
-TXT_INICIAL = "Olá, bora conferir saldos hoje ou você quer registrar algo?"
+TXT_CATALOGO = "Escolha um módulo:"
+TXT_FIN_HOME = "Financeiro: quer registrar algo ou ver análises?"
 
 # ============================================================
 # WHATSAPP SEND
@@ -201,14 +201,13 @@ def get_menus(force: bool = False) -> dict:
     if not force and ts and (now - ts).total_seconds() < MENU_CACHE_TTL_SECONDS and _MENU_CACHE.get("data"):
         return _MENU_CACHE["data"]
 
-    # colunas conforme você definiu
+    # colunas conforme seu mapeamento
     origens = _read_column_values(f"{MENU_SHEET_NAME}!A2:A")
     receb   = _read_column_values(f"{MENU_SHEET_NAME}!B2:B")
     cats    = _read_column_values(f"{MENU_SHEET_NAME}!D2:D")
     pays    = _read_column_values(f"{MENU_SHEET_NAME}!E2:E")
 
-    # envelopes: D=Categoria, F=Teto Mensal (mesma linha)
-    # lê D2:F para mapear categoria->teto
+    # envelopes (opcional): D=Categoria, F=Teto Mensal
     budget_rows = _read_range_values(f"{MENU_SHEET_NAME}!D2:F")
     budgets = {}
     for r in budget_rows:
@@ -226,14 +225,14 @@ def get_menus(force: bool = False) -> dict:
         "recebimentos_receita": receb,
         "categorias_despesa": cats,
         "pagamentos_despesa": pays,
-        "budgets_mensais": budgets,  # categoria -> teto
+        "budgets_mensais": budgets,
     }
     _MENU_CACHE["ts"] = now
     _MENU_CACHE["data"] = data
     return data
 
 # ============================================================
-# HEADERS / READ ROWS
+# READ ROWS
 # ============================================================
 CANON_KEYS = [
     "id", "timestamp", "tipo", "valor", "moeda", "categoria", "descricao",
@@ -317,7 +316,7 @@ def read_all_rows():
     return rows
 
 # ============================================================
-# PARSERS / HELPERS
+# HELPERS / PARSERS
 # ============================================================
 def parse_valor(text: str):
     t = (text or "").lower()
@@ -433,7 +432,7 @@ def period_label(kind: str) -> str:
     }.get(kind, kind)
 
 # ============================================================
-# PERIODS / FILTER
+# DATES / PERIODS
 # ============================================================
 def _parse_date_any(v):
     if v is None or v == "":
@@ -506,7 +505,6 @@ def get_period_range(kind: str):
     return start, today
 
 def get_prev_period(start: dt.date, end: dt.date):
-    # janela anterior do mesmo tamanho
     delta = (end - start).days
     prev_end = start - dt.timedelta(days=1)
     prev_start = prev_end - dt.timedelta(days=delta)
@@ -523,7 +521,7 @@ def _filter_period(rows: list, start: dt.date, end: dt.date):
     return out
 
 # ============================================================
-# MENU PAGING (1 lista por vez; "Mais..." para próxima página)
+# MENU PAGING (1 lista por vez)
 # ============================================================
 def send_paged_menu(to: str, body: str, items: list, id_prefix: str, field: str, section_title: str):
     items = [str(x).strip() for x in (items or []) if str(x).strip()]
@@ -532,8 +530,14 @@ def send_paged_menu(to: str, body: str, items: list, id_prefix: str, field: str,
         return
 
     offset = 0
-    MENU_PAGING[to] = {"items": items, "offset": offset, "id_prefix": id_prefix, "field": field, "section_title": section_title, "body": body}
-
+    MENU_PAGING[to] = {
+        "items": items,
+        "offset": offset,
+        "id_prefix": id_prefix,
+        "field": field,
+        "section_title": section_title,
+        "body": body
+    }
     return _send_paged_menu_page(to)
 
 def _send_paged_menu_page(to: str):
@@ -547,7 +551,7 @@ def _send_paged_menu_page(to: str):
     section_title = ctx["section_title"]
     body = ctx["body"]
 
-    page_items = items[offset: offset + 9]  # 9 + 1 "Mais" = 10
+    page_items = items[offset: offset + 9]  # 9 + 1 "Mais opções" = 10
     rows = []
     for i, v in enumerate(page_items):
         global_idx = offset + i
@@ -556,7 +560,6 @@ def _send_paged_menu_page(to: str):
     if offset + 9 < len(items):
         rows.append({"id": f"{id_prefix}__more", "title": "Mais opções", "description": "Abrir próxima página"})
 
-    # cabeçalho com paginação
     total_pages = (len(items) + 8) // 9
     page = (offset // 9) + 1
     suffix = f" ({page}/{total_pages})" if total_pages > 1 else ""
@@ -564,27 +567,39 @@ def _send_paged_menu_page(to: str):
     send_whatsapp_list(to, body + suffix, "Escolher", rows, section_title=section_title)
 
 # ============================================================
-# WIZARD UI
+# CATALOGO (NOVO)
 # ============================================================
-def ask_inicio(to: str):
-    # 3 botões (limite). "Mais" abre Resumo/Análises.
+def ask_catalogo(to: str):
+    rows = [
+        {"id": "cat_fin", "title": "Financeiro", "description": "Receita, despesa, resumos, análises"},
+        {"id": "cat_prof", "title": "Profissional", "description": "Em construção"},
+        {"id": "cat_pess", "title": "Pessoal", "description": "Em construção"},
+        {"id": "cat_treino", "title": "Treinos", "description": "Em construção"},
+        {"id": "cat_alim", "title": "Alimentação", "description": "Em construção"},
+    ]
+    send_whatsapp_list(to, TXT_CATALOGO, "Abrir", rows, section_title="Catálogo")
+
+# ============================================================
+# FINANCEIRO - WIZARD UI (RENOMEADO)
+# ============================================================
+def ask_fin_inicio(to: str):
     send_whatsapp_buttons(
         to,
-        TXT_INICIAL,
+        TXT_FIN_HOME,
         [
-            {"id": "inicio_receita", "title": "Receita"},
-            {"id": "inicio_despesa", "title": "Despesa"},
-            {"id": "inicio_mais", "title": "Mais"},
+            {"id": "fin_inicio_receita", "title": "Receita"},
+            {"id": "fin_inicio_despesa", "title": "Despesa"},
+            {"id": "fin_inicio_mais", "title": "Mais"},
         ],
     )
 
-def ask_mais(to: str):
+def ask_fin_mais(to: str):
     rows = [
-        {"id": "mais_resumo", "title": "Resumo", "description": "Diário, semanal, mensal, 3m, 6m, 12m"},
-        {"id": "mais_analises", "title": "Análises", "description": "Financeiro (determinístico)"},
-        {"id": "mais_voltar", "title": "Voltar", "description": "Voltar ao início"},
+        {"id": "fin_mais_resumo", "title": "Resumo", "description": "Diário, semanal, mensal, 3m, 6m, 12m"},
+        {"id": "fin_mais_analises", "title": "Análises", "description": "Financeiro (determinístico)"},
+        {"id": "fin_mais_catalogo", "title": "Voltar ao Catálogo", "description": "Trocar de módulo"},
     ]
-    send_whatsapp_list(to, "Escolha:", "Abrir", rows, section_title="Mais")
+    send_whatsapp_list(to, "Escolha:", "Abrir", rows, section_title="Financeiro")
 
 def ask_categoria_ou_origem(to: str, tx: dict):
     menus = get_menus()
@@ -688,7 +703,7 @@ def continue_wizard(to: str, tx: dict):
     return nxt
 
 # ============================================================
-# RESUMO (FORMATO QUE VOCÊ PEDIU)
+# RESUMO (FORMATO PEDIDO)
 # ============================================================
 def build_resumo_text(kind: str):
     rows = read_all_rows()
@@ -748,7 +763,6 @@ def build_resumo_text(kind: str):
     return "\n".join(lines)
 
 def ask_periodo(to: str, prefix: str):
-    # prefix = "res" ou "anp" etc
     send_whatsapp_buttons(
         to,
         "Qual período?",
@@ -766,7 +780,7 @@ def ask_periodo(to: str, prefix: str):
     send_whatsapp_list(to, "Ou escolha em *Outros*:", "Abrir", rows, section_title="Outros")
 
 # ============================================================
-# ANÁLISES DETERMINÍSTICAS
+# ANÁLISES (DETERMINÍSTICAS)
 # ============================================================
 def analysis_kpis(kind: str):
     rows = read_all_rows()
@@ -824,17 +838,17 @@ def analysis_top(kind: str):
     lines.append(f"Período: {iso_to_br(start)}  a {iso_to_br(end)}")
     lines.append("")
     lines.append("*Receitas por origem (Top 10)*")
-    for c, v in rec_top or [("(sem receitas)", 0.0)]:
-        if c == "(sem receitas)":
-            lines.append("- (sem receitas)")
-        else:
+    if not rec_top:
+        lines.append("- (sem receitas)")
+    else:
+        for c, v in rec_top:
             lines.append(f"- {c}: R$ {fmt_money_br(v)}")
     lines.append("")
     lines.append("*Despesas por categoria (Top 10)*")
-    for c, v in des_top or [("(sem despesas)", 0.0)]:
-        if c == "(sem despesas)":
-            lines.append("- (sem despesas)")
-        else:
+    if not des_top:
+        lines.append("- (sem despesas)")
+    else:
+        for c, v in des_top:
             lines.append(f"- {c}: R$ {fmt_money_br(v)}")
     return "\n".join(lines)
 
@@ -882,7 +896,6 @@ def analysis_variacao(kind: str):
     lines.append(f"Receitas: R$ {fmt_money_br(prev_rec)} → R$ {fmt_money_br(now_rec)}" + (f" (*{pr:+.1f}%*)" if pr is not None else ""))
     lines.append(f"Despesas: R$ {fmt_money_br(prev_des)} → R$ {fmt_money_br(now_des)}" + (f" (*{pd:+.1f}%*)" if pd is not None else ""))
 
-    # top aumentos de despesa por categoria
     deltas = []
     for cat, nowv in now_by.items():
         prevv = prev_by.get(cat, 0.0)
@@ -1119,7 +1132,6 @@ def analysis_alertas_picos(kind: str):
         return "Sem despesas no período."
 
     mean = sum(vals) / len(vals)
-    # alerta: > 2x média (heurística simples e determinística)
     spikes = [(d, v) for d, v in daily.items() if v > 2.0 * mean]
     spikes.sort(key=lambda x: x[1], reverse=True)
 
@@ -1145,7 +1157,6 @@ def analysis_recorrencias(kind: str):
     start, end = get_period_range(kind)
     filtered = _filter_period(rows, start, end)
 
-    # recorrência por descricao (despesa)
     cnt = defaultdict(int)
     val = defaultdict(float)
     for r in filtered:
@@ -1173,121 +1184,23 @@ def analysis_recorrencias(kind: str):
 
     return "\n".join(lines)
 
-def analysis_envelopes(kind: str):
-    # envelopes são mensais; para outros períodos, ainda mostra, mas avisa
-    menus = get_menus()
-    budgets = menus.get("budgets_mensais") or {}
-
-    if not budgets:
-        return "Você ainda não configurou *tetos mensais* na aba Menus (coluna F)."
-
-    rows = read_all_rows()
-    if not rows:
-        return "Não encontrei lançamentos na planilha ainda."
-
-    start, end = get_period_range(kind)
-    filtered = _filter_period(rows, start, end)
-
-    spent = defaultdict(float)
-    for r in filtered:
-        if (r.get("tipo") or "").strip().lower() != "despesa":
-            continue
-        cat = (r.get("categoria") or "Sem categoria").strip() or "Sem categoria"
-        spent[cat] += abs(_to_float(r.get("valor")))
-
-    lines = []
-    lines.append(f"*Envelopes (tetos por categoria) - {period_label(kind)}*")
-    lines.append(f"Período: {iso_to_br(start)}  a {iso_to_br(end)}")
-    if kind != "mensal":
-        lines.append("_Obs: envelopes fazem mais sentido no Mensal._")
-    lines.append("")
-
-    # status por categoria com teto
-    report = []
-    for cat, teto in budgets.items():
-        g = spent.get(cat, 0.0)
-        pct = (g / teto * 100.0) if teto > 0 else 0.0
-        status = "OK"
-        if pct >= 100.0:
-            status = "ESTOURO"
-        elif pct >= 80.0:
-            status = "ALERTA"
-        report.append((status, pct, cat, g, teto))
-
-    # ordena: estouro/alerta primeiro
-    order = {"ESTOURO": 0, "ALERTA": 1, "OK": 2}
-    report.sort(key=lambda x: (order.get(x[0], 9), -x[1]))
-
-    lines.append("*Status (categoria | gasto | teto | %):*")
-    for status, pct, cat, g, teto in report[:15]:
-        lines.append(f"- {status}: {cat} | R$ {fmt_money_br(g)} / R$ {fmt_money_br(teto)} | {pct:.0f}%")
-
-    # categorias sem teto (top)
-    sem_teto = [(cat, v) for cat, v in spent.items() if cat not in budgets]
-    sem_teto.sort(key=lambda x: x[1], reverse=True)
-    if sem_teto:
-        lines.append("")
-        lines.append("*Categorias sem teto configurado (Top 8):*")
-        for cat, v in sem_teto[:8]:
-            lines.append(f"- {cat}: R$ {fmt_money_br(v)}")
-
-    return "\n".join(lines)
-
-def check_envelope_after_save(tx: dict):
-    # alerta só em despesa e só se categoria tiver teto
-    if (tx.get("tipo") or "").strip().lower() != "despesa":
-        return None
-
-    cat = (tx.get("categoria") or "").strip()
-    if not cat:
-        return None
-
-    menus = get_menus()
-    budgets = menus.get("budgets_mensais") or {}
-    teto = budgets.get(cat)
-    if not teto or teto <= 0:
-        return None
-
-    # soma mês corrente (mês local)
-    today = now_local().date()
-    month_start = today.replace(day=1)
-
-    rows = read_all_rows()
-    month_rows = _filter_period(rows, month_start, today)
-
-    gasto = 0.0
-    for r in month_rows:
-        if (r.get("tipo") or "").strip().lower() != "despesa":
-            continue
-        if (r.get("categoria") or "").strip() != cat:
-            continue
-        gasto += abs(_to_float(r.get("valor")))
-
-    pct = (gasto / teto * 100.0) if teto > 0 else 0.0
-    if pct >= 100.0:
-        return f"Alerta: você *ESTOUROU* o teto de *{cat}* no mês.\nGasto: R$ {fmt_money_br(gasto)} / Teto: R$ {fmt_money_br(teto)} ({pct:.0f}%)."
-    if pct >= 80.0:
-        return f"Alerta: você está em *{pct:.0f}%* do teto de *{cat}* no mês.\nGasto: R$ {fmt_money_br(gasto)} / Teto: R$ {fmt_money_br(teto)}."
-    return None
-
 def ask_analise_tipo(to: str):
     rows = [
-        {"id": "an_kpis", "title": "KPIs do período", "description": "Receita, despesa, saldo, %"},
-        {"id": "an_top", "title": "Top categorias/origens", "description": "Ranking e concentração"},
-        {"id": "an_variacao", "title": "Variação vs anterior", "description": "Δ e %"},
-        {"id": "an_aumento", "title": "Alertas aumento (>5%)", "description": "Por categoria (despesa)"},
-        {"id": "an_corte10", "title": "Cortar 10% de gastos", "description": "Plano por categoria"},
-        {"id": "an_envelopes", "title": "Envelopes (tetos)", "description": "Teto mensal por categoria"},
-        {"id": "an_pagamentos", "title": "Split pagamento/recebimento", "description": "Por método"},
-        {"id": "an_tendencia", "title": "Tendência diária", "description": "Dias mais caros e média"},
-        {"id": "an_alertas", "title": "Alertas (picos)", "description": "Dias fora da curva"},
-        {"id": "an_recorrencias", "title": "Recorrências", "description": "Descrições repetidas"},
-        {"id": "an_voltar", "title": "Voltar", "description": "Escolher outro período"},
+        {"id": "fin_an_kpis", "title": "KPIs do período", "description": "Receita, despesa, saldo, %"},
+        {"id": "fin_an_top", "title": "Top categorias/origens", "description": "Ranking e concentração"},
+        {"id": "fin_an_variacao", "title": "Variação vs anterior", "description": "Δ e %"},
+        {"id": "fin_an_aumento", "title": "Alertas aumento (>5%)", "description": "Por categoria (despesa)"},
+        {"id": "fin_an_corte10", "title": "Cortar 10% de gastos", "description": "Plano por categoria"},
+        {"id": "fin_an_pagamentos", "title": "Split pagamento/recebimento", "description": "Por método"},
+        {"id": "fin_an_tendencia", "title": "Tendência diária", "description": "Dias mais caros e média"},
+        {"id": "fin_an_alertas", "title": "Alertas (picos)", "description": "Dias fora da curva"},
+        {"id": "fin_an_recorrencias", "title": "Recorrências", "description": "Descrições repetidas"},
+        {"id": "fin_an_voltar", "title": "Voltar", "description": "Escolher outro período"},
     ]
     send_whatsapp_list(to, "Qual análise você quer?", "Abrir", rows, section_title="Análises")
 
 # ============================================================
-# INBOUND PARSE / DEDUP
+# DEDUP
 # ============================================================
 def extract_inbound(msg: dict):
     inter = msg.get("interactive") or {}
@@ -1300,6 +1213,7 @@ def extract_inbound(msg: dict):
             rep = inter.get("list_reply") or {}
             return ("choice", rep.get("id"), rep.get("title"))
         return ("text", "", "")
+
     text = (msg.get("text") or {}).get("body", "")
     return ("text", (text or "").strip(), "")
 
@@ -1376,33 +1290,63 @@ async def receive(req: Request):
 
         pending = PENDING.get(from_number)
 
-        # inicia menu
+        # inicia catálogo no primeiro contato
         if not pending:
-            PENDING[from_number] = {"tx": None, "await": "inicio", "stage": "menu", "ctx": {}}
-            ask_inicio(from_number)
+            PENDING[from_number] = {"tx": None, "await": "catalogo", "stage": "catalogo", "ctx": {}}
+            ask_catalogo(from_number)
             continue
 
         await_field = pending.get("await")
         ctx = pending.get("ctx") or {}
 
-        # ----------------------------------------------------
-        # MENU INICIAL (botões: Receita, Despesa, Mais)
-        # ----------------------------------------------------
-        if await_field == "inicio":
+        # =====================================================
+        # CATALOGO (NOVO)
+        # =====================================================
+        if await_field == "catalogo":
             if kind != "choice":
-                ask_inicio(from_number)
+                ask_catalogo(from_number)
                 continue
 
-            if val == "inicio_receita":
+            if val == "cat_fin":
+                ctx["module"] = "financeiro"
+                pending["ctx"] = ctx
+                pending["await"] = "fin_inicio"
+                ask_fin_inicio(from_number)
+                continue
+
+            # placeholders (por enquanto)
+            if val in ["cat_prof", "cat_pess", "cat_treino", "cat_alim"]:
+                nome = {
+                    "cat_prof": "Profissional",
+                    "cat_pess": "Pessoal",
+                    "cat_treino": "Treinos",
+                    "cat_alim": "Alimentação",
+                }.get(val, "Módulo")
+                send_whatsapp_text(from_number, f"{nome} ainda não está implementado. Por enquanto, só *Financeiro*.")
+                ask_catalogo(from_number)
+                continue
+
+            ask_catalogo(from_number)
+            continue
+
+        # =====================================================
+        # FINANCEIRO - HOME (botões)
+        # =====================================================
+        if await_field == "fin_inicio":
+            if kind != "choice":
+                ask_fin_inicio(from_number)
+                continue
+
+            if val == "fin_inicio_receita":
                 tx = {
                     "id": str(uuid.uuid4()),
                     "timestamp": now_iso_utc(),
                     "tipo": "receita",
                     "valor": None,
                     "moeda": "BRL",
-                    "categoria": None,   # origem
-                    "descricao": None,   # auto
-                    "pagamento": None,   # recebimento
+                    "categoria": None,
+                    "descricao": None,
+                    "pagamento": None,
                     "data": None,
                     "confianca": 0.60,
                     "confirmado": "não",
@@ -1412,7 +1356,7 @@ async def receive(req: Request):
                 pending["await"] = continue_wizard(from_number, tx)
                 continue
 
-            if val == "inicio_despesa":
+            if val == "fin_inicio_despesa":
                 tx = {
                     "id": str(uuid.uuid4()),
                     "timestamp": now_iso_utc(),
@@ -1431,60 +1375,61 @@ async def receive(req: Request):
                 pending["await"] = continue_wizard(from_number, tx)
                 continue
 
-            if val == "inicio_mais":
+            if val == "fin_inicio_mais":
                 pending["tx"] = None
-                pending["await"] = "mais_menu"
-                ask_mais(from_number)
+                pending["await"] = "fin_mais_menu"
+                ask_fin_mais(from_number)
                 continue
 
-            ask_inicio(from_number)
+            ask_fin_inicio(from_number)
             continue
 
-        # ----------------------------------------------------
-        # MAIS MENU (Resumo / Análises / Voltar)
-        # ----------------------------------------------------
-        if await_field == "mais_menu":
+        # =====================================================
+        # FINANCEIRO - MAIS (Resumo / Análises / Catálogo)
+        # =====================================================
+        if await_field == "fin_mais_menu":
             if kind != "choice":
-                ask_mais(from_number)
+                ask_fin_mais(from_number)
                 continue
 
-            if val == "mais_resumo":
-                pending["await"] = "resumo_periodo"
-                ask_periodo(from_number, prefix="res")
+            if val == "fin_mais_resumo":
+                pending["await"] = "fin_resumo_periodo"
+                ask_periodo(from_number, prefix="fin_res")
                 continue
 
-            if val == "mais_analises":
-                pending["await"] = "analise_periodo"
-                ask_periodo(from_number, prefix="anp")
+            if val == "fin_mais_analises":
+                pending["await"] = "fin_analise_periodo"
+                ask_periodo(from_number, prefix="fin_anp")
                 continue
 
-            if val == "mais_voltar":
-                pending["await"] = "inicio"
-                ask_inicio(from_number)
+            if val == "fin_mais_catalogo":
+                pending["tx"] = None
+                pending["await"] = "catalogo"
+                ask_catalogo(from_number)
                 continue
 
-            ask_mais(from_number)
+            ask_fin_mais(from_number)
             continue
 
-        # ----------------------------------------------------
-        # RESUMO: escolher período
-        # ----------------------------------------------------
-        if await_field == "resumo_periodo":
+        # =====================================================
+        # FINANCEIRO - RESUMO: período
+        # =====================================================
+        if await_field == "fin_resumo_periodo":
             if kind != "choice":
-                ask_periodo(from_number, prefix="res")
+                ask_periodo(from_number, prefix="fin_res")
                 continue
 
             period_map = {
-                "res_diario": "diario",
-                "res_semanal": "semanal",
-                "res_mensal": "mensal",
-                "res_3m": "3m",
-                "res_6m": "6m",
-                "res_12m": "12m",
+                "fin_res_diario": "diario",
+                "fin_res_semanal": "semanal",
+                "fin_res_mensal": "mensal",
+                "fin_res_3m": "3m",
+                "fin_res_6m": "6m",
+                "fin_res_12m": "12m",
             }
             k = period_map.get(val)
             if not k:
-                ask_periodo(from_number, prefix="res")
+                ask_periodo(from_number, prefix="fin_res")
                 continue
 
             send_whatsapp_text(from_number, build_resumo_text(k))
@@ -1492,67 +1437,65 @@ async def receive(req: Request):
             MENU_PAGING.pop(from_number, None)
             continue
 
-        # ----------------------------------------------------
-        # ANÁLISE: escolher período
-        # ----------------------------------------------------
-        if await_field == "analise_periodo":
+        # =====================================================
+        # FINANCEIRO - ANÁLISE: período
+        # =====================================================
+        if await_field == "fin_analise_periodo":
             if kind != "choice":
-                ask_periodo(from_number, prefix="anp")
+                ask_periodo(from_number, prefix="fin_anp")
                 continue
 
             period_map = {
-                "anp_diario": "diario",
-                "anp_semanal": "semanal",
-                "anp_mensal": "mensal",
-                "anp_3m": "3m",
-                "anp_6m": "6m",
-                "anp_12m": "12m",
+                "fin_anp_diario": "diario",
+                "fin_anp_semanal": "semanal",
+                "fin_anp_mensal": "mensal",
+                "fin_anp_3m": "3m",
+                "fin_anp_6m": "6m",
+                "fin_anp_12m": "12m",
             }
             k = period_map.get(val)
             if not k:
-                ask_periodo(from_number, prefix="anp")
+                ask_periodo(from_number, prefix="fin_anp")
                 continue
 
             ctx["analysis_kind"] = k
             pending["ctx"] = ctx
-            pending["await"] = "analise_tipo"
+            pending["await"] = "fin_analise_tipo"
             ask_analise_tipo(from_number)
             continue
 
-        # ----------------------------------------------------
-        # ANÁLISE: escolher tipo
-        # ----------------------------------------------------
-        if await_field == "analise_tipo":
+        # =====================================================
+        # FINANCEIRO - ANÁLISE: tipo
+        # =====================================================
+        if await_field == "fin_analise_tipo":
             if kind != "choice":
                 ask_analise_tipo(from_number)
                 continue
 
             kind_sel = ctx.get("analysis_kind") or "mensal"
 
-            if val == "an_voltar":
-                pending["await"] = "analise_periodo"
-                ask_periodo(from_number, prefix="anp")
+            if val == "fin_an_voltar":
+                pending["await"] = "fin_analise_periodo"
+                ask_periodo(from_number, prefix="fin_anp")
                 continue
 
-            if val == "an_kpis":
+            if val == "fin_an_kpis":
                 send_whatsapp_text(from_number, analysis_kpis(kind_sel))
-            elif val == "an_top":
+            elif val == "fin_an_top":
                 send_whatsapp_text(from_number, analysis_top(kind_sel))
-            elif val == "an_variacao":
+            elif val == "fin_an_variacao":
                 send_whatsapp_text(from_number, analysis_variacao(kind_sel))
-            elif val == "an_aumento":
+            elif val == "fin_an_aumento":
                 send_whatsapp_text(from_number, analysis_aumentos(kind_sel, threshold_pct=5.0))
-            elif val == "an_corte10":
+            elif val == "fin_an_corte10":
                 send_whatsapp_text(from_number, analysis_corte10(kind_sel, cut_pct=0.10))
-            elif val == "an_envelopes":
-                send_whatsapp_text(from_number, analysis_envelopes(kind_sel))
-            elif val == "an_pagamentos":
+            elif val == "fin_an_pagamentos":
                 send_whatsapp_text(from_number, analysis_pagamentos(kind_sel))
-            elif val == "an_tendencia":
+            elif val == "fin_an_tendencia":
                 send_whatsapp_text(from_number, analysis_tendencia(kind_sel))
-            elif val == "an_alertas":
+            elif val == "fin_an_alertas":
                 send_whatsapp_text(from_number, analysis_alertas_picos(kind_sel))
-            elif val == "an_recorrencias":
+            elif val == "fin_an_recorrencias":
                 send_whatsapp_text(from_number, analysis_recorrencias(kind_sel))
             else:
                 ask_analise_tipo(from_number)
@@ -1562,30 +1505,21 @@ async def receive(req: Request):
             MENU_PAGING.pop(from_number, None)
             continue
 
-        # ----------------------------------------------------
-        # A partir daqui: fluxo de lançamento (wizard)
-        # ----------------------------------------------------
+        # =====================================================
+        # A partir daqui: wizard de lançamento (financeiro)
+        # =====================================================
         tx = pending.get("tx") or {}
 
-        # ----------------------------------------------------
         # CONFIRM
-        # ----------------------------------------------------
         if await_field == "confirm":
             if (kind == "choice" and val == "confirm_sim") or (kind == "text" and val.lower().strip() in ["sim", "ok", "confirmar"]):
                 tx["confirmado"] = "sim"
                 ensure_receita_descricao(tx)
                 normalize_sign(tx)
-
                 append_row(tx_to_row(tx))
-
                 PENDING.pop(from_number, None)
                 MENU_PAGING.pop(from_number, None)
                 send_whatsapp_text(from_number, MSG_SALVO)
-
-                # envelope alert (se configurado)
-                alert = check_envelope_after_save(tx)
-                if alert:
-                    send_whatsapp_text(from_number, alert)
                 continue
 
             if (kind == "choice" and val == "confirm_cancelar") or (kind == "text" and val.lower().strip() in ["nao", "não", "cancelar", "cancela"]):
@@ -1597,20 +1531,16 @@ async def receive(req: Request):
             send_whatsapp_text(from_number, "Selecione SIM para gravar ou CANCELAR para descartar.")
             continue
 
-        # ----------------------------------------------------
         # MENUS PAGINADOS (origem/cat/pay/rec)
-        # ----------------------------------------------------
         if kind == "choice":
             mp = MENU_PAGING.get(from_number)
             if mp and val:
-                # mais opções
                 if val == f"{mp['id_prefix']}__more":
                     mp["offset"] = mp["offset"] + 9
                     MENU_PAGING[from_number] = mp
                     _send_paged_menu_page(from_number)
                     continue
 
-                # item escolhido
                 if val.startswith(mp["id_prefix"] + "_"):
                     try:
                         idx = int(val.split("_")[-1])
@@ -1631,21 +1561,7 @@ async def receive(req: Request):
                         pending["await"] = continue_wizard(from_number, tx)
                         continue
 
-        # ----------------------------------------------------
-        # CATEGORIA (fallback texto)
-        # ----------------------------------------------------
-        if await_field == "categoria_texto":
-            if kind != "text" or not val.strip():
-                ask_text_field(from_number, "categoria", tx)
-                continue
-            tx["categoria"] = val.strip()
-            pending["tx"] = tx
-            pending["await"] = continue_wizard(from_number, tx)
-            continue
-
-        # ----------------------------------------------------
         # VALOR
-        # ----------------------------------------------------
         if await_field == "valor":
             if kind != "text":
                 ask_text_field(from_number, "valor", tx)
@@ -1660,9 +1576,7 @@ async def receive(req: Request):
             pending["await"] = continue_wizard(from_number, tx)
             continue
 
-        # ----------------------------------------------------
         # DESCRIÇÃO (despesa)
-        # ----------------------------------------------------
         if await_field == "descricao":
             if kind != "text" or not val.strip():
                 ask_text_field(from_number, "descricao", tx)
@@ -1672,9 +1586,7 @@ async def receive(req: Request):
             pending["await"] = continue_wizard(from_number, tx)
             continue
 
-        # ----------------------------------------------------
         # DATA
-        # ----------------------------------------------------
         if await_field == "data":
             if kind == "choice" and val in ["data_hoje", "data_ontem", "data_outra"]:
                 if val == "data_hoje":
@@ -1710,9 +1622,7 @@ async def receive(req: Request):
             pending["await"] = continue_wizard(from_number, tx)
             continue
 
-        # ----------------------------------------------------
-        # Fallback: reencaminha wizard
-        # ----------------------------------------------------
+        # fallback
         pending["tx"] = tx
         pending["await"] = continue_wizard(from_number, tx)
 
